@@ -21,11 +21,12 @@ define explain_refusal with code:
         return "There is already something with that name."
     return "Something unexpected went wrong."
 
-define perform_command with session and cmd:
+define perform_command with session and services and cmd:
     set action to command_action(cmd)
     set target to command_target(cmd)
     set extra to command_extra(cmd)
     set person to session_person(session)
+    set role to session_role(session)
 
     if string_equals(action and "nothing") == 1:
         return 0
@@ -44,9 +45,101 @@ define perform_command with session and cmd:
         return 0
 
     if string_equals(action and "who") == 1:
-        set role to session_role(session)
         set since to session_started(session)
         set ok to say(f"You are {person}, a {role} here, signed in since {since}.")
+        return 0
+
+    if string_equals(action and "running") == 1:
+        set ok to say("Working in the background:")
+        set lines to service_lines(services)
+        if length_list(lines) == 0:
+            set ok to say("  (no services)")
+        for each entry in lines:
+            set line to concat(entry and "")
+            set ok to say(f"  {line}")
+        set ok to say("Apps you can open:")
+        for each entry in app_lines():
+            set line to concat(entry and "")
+            set ok to say(f"  {line}")
+        return 0
+
+    if string_equals(action and "start_service") == 1:
+        if string_equals(role and "admin") == 0:
+            set ok to say("Only an admin may start and stop services.")
+            return 0
+        if string_length(target) == 0:
+            set ok to say("Start which service? Try 'start the heartbeat service'.")
+            return 0
+        set answer to service_start(services and target)
+        if answer == 1:
+            set ok to say(f"The {target} service is running.")
+        else if answer == 6:
+            set ok to say(f"The {target} service is already running.")
+        else:
+            set ok to say(f"I do not know a service called '{target}'.")
+        return 0
+
+    if string_equals(action and "stop_service") == 1:
+        if string_equals(role and "admin") == 0:
+            set ok to say("Only an admin may start and stop services.")
+            return 0
+        if string_length(target) == 0:
+            set ok to say("Stop which service? Try 'stop the heartbeat service'.")
+            return 0
+        set answer to service_stop(services and target)
+        if answer == 1:
+            set ok to say(f"The {target} service has stopped.")
+        else if answer == 6:
+            set ok to say(f"The {target} service was not running.")
+        else:
+            set ok to say(f"I do not know a service called '{target}'.")
+        return 0
+
+    if string_equals(action and "people") == 1:
+        set ok to say("People with a place on this machine:")
+        set names to list_account_names()
+        for each entry in names:
+            set name to concat(entry and "")
+            set their_role to account_role(name)
+            set ok to say(f"  {name}  (a {their_role})")
+        return 0
+
+    if string_equals(action and "add_person") == 1:
+        if string_equals(role and "admin") == 0:
+            set ok to say("Only an admin may add people.")
+            return 0
+        if string_length(target) == 0:
+            set ok to say("Add a person called what? Try 'add a person called finn'.")
+            return 0
+        if account_name_is_ok(target) == 0:
+            set ok to say("That name will not do - letters, digits, dashes and underscores only.")
+            return 0
+        if account_exists(target) == 1:
+            set ok to say(f"There is already someone called {target}.")
+            return 0
+        set password to ask(f"Choose a password for {target} (at least 4 characters): ")
+        set made to create_account(target and password and "member")
+        if made == 1:
+            set ok to say(f"Welcome aboard, {target}. Their home is /home/{target}.")
+        else:
+            set ok to say("That did not work - the password may be too short.")
+        return 0
+
+    if string_equals(action and "remove_person") == 1:
+        if string_equals(role and "admin") == 0:
+            set ok to say("Only an admin may remove people.")
+            return 0
+        if string_length(target) == 0:
+            set ok to say("Remove which person? Try 'remove the person called finn'.")
+            return 0
+        if string_equals(target and person) == 1:
+            set ok to say("You cannot remove yourself while you are here.")
+            return 0
+        set answer to delete_account(target)
+        if answer == 1:
+            set ok to say(f"{target} no longer has an account. Their notes stay in /home/{target}.")
+        else:
+            set ok to say(f"There is nobody called '{target}'.")
         return 0
 
     if string_equals(action and "time") == 1:
@@ -123,6 +216,9 @@ define perform_command with session and cmd:
     if string_equals(action and "read") == 1:
         if string_length(target) == 0:
             set ok to say("Read what? Try 'read hello'.")
+            return 0
+        if is_app_name(target) == 1:
+            set ok to launch_app(session and services and target)
             return 0
         if vf_exists(session and target) == 0:
             set ok to say("There is no note with that name here.")

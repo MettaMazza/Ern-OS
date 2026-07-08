@@ -8,7 +8,8 @@ provides. `tests/run_all_tests.sh` enforces this with the layer lint; a
 build fails if anything above the hal calls the host.
 
 ```
-userland   system/shell/*.ep     may use: kernel
+userland   system/shell/*.ep     may use: kernel (and the hal's say/ask/clock)
+           system/apps/*.ep
 kernel     system/kernel/*.ep    may use: hal
 hal        system/hal/*.ep       may use: the host (vendored stdlib)
 ```
@@ -40,6 +41,16 @@ can ever reach outside the disk folder, no matter how confused it gets.
 | `user_accounts.ep` | people and their password fingerprints |
 | `sessions.ep` | who is at the keyboard, where they are standing |
 | `system_log.ep` | the diary at `/system/log/system.log` |
+| `services.ep` | the service table (heartbeat, uptime, the boot moment) |
+
+**Why services carry no threads yet.** The runtime's garbage collector
+is not thread-safe today: a password check (a SHA-256 loop) crashes if
+any spawned thread merely exists — a deterministic repro is filed in
+the language repo. The two-channel threaded service design (orders in,
+answers out, integer messages) was built and proven by probes, lives in
+this repo's git history, and returns the day the GC is fixed. Until
+then a service is an honest table entry, and heartbeat beats are the
+seconds since it started.
 
 Answer codes: kernel actions that change things return a small number —
 1 it worked, 2 not allowed, 3 bad name, 4 no such thing, 5 folder not
@@ -50,7 +61,7 @@ Passwords are never stored. A record keeps `salt` (16 random bytes) and
 also names its `scheme`, so a stronger scheme can arrive later and old
 records can be migrated at login.
 
-### userland — the conversation
+### userland — the conversation and the apps
 
 | file | its job |
 |---|---|
@@ -58,6 +69,15 @@ records can be migrated at login.
 | `do_command.ep` | command → kernel calls → answer in English |
 | `help_text.ep` | the help |
 | `the_shell.ep` | login and the listen–understand–do–answer loop |
+| `apps/app_registry.ep` | which apps exist, opening one by name |
+| `apps/notes.ep` | line-by-line note editor |
+| `apps/files.ep` | numbered folder walker |
+| `apps/monitor.ep` | the system report |
+| `apps/welcome.ep` | the first-day tour (opens itself on first login) |
+
+Apps run in the foreground, in the same program: opening one hands it
+the conversation until it says done. There is at most one at a time,
+one owner of the terminal, and no way to lose data in a handoff.
 
 ## One program, one manifest
 

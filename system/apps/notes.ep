@@ -1,0 +1,159 @@
+# notes — a small editor for changing a note line by line.
+#
+# Userland app. Runs in the foreground: it borrows the conversation until
+# the person says done. Works on notes in the folder the person is
+# standing in.
+
+### The lines of a note, as a list. An empty note has no lines.
+define note_lines with content as Str:
+    set lines to create_list()
+    if string_length(content) == 0:
+        return lines
+    set pieces to split(content and "\n")
+    for each piece in pieces:
+        set line to concat(piece and "")
+        set ok to append_list(lines and line)
+    return lines
+
+### Show the lines with their numbers.
+define show_note_lines with lines:
+    if length_list(lines) == 0:
+        set ok to say("  (the note is empty)")
+        return 0
+    set n to length_list(lines)
+    set i to 0
+    repeat while i < n:
+        set line to concat(get_list(lines and i) and "")
+        set ok to say(f"  {i + 1}| {line}")
+        set i to i + 1
+    return 0
+
+### Edit one note until the person says done.
+define edit_note with session and name as Str:
+    set content to vf_read(session and name)
+    set lines to note_lines(content)
+    if vf_exists(session and name) == 1:
+        set ok to say(f"Editing {name}:")
+    else:
+        set ok to say(f"Starting a fresh note called {name}.")
+    set ok to show_note_lines(lines)
+    set ok to say("Say: add <words>, change <number> to <words>, remove <number>, show, save, done.")
+    set unsaved to 0
+    repeat while 1 == 1:
+        set raw to ask("  line> ")
+        set lowered to string_to_lower(concat(raw and ""))
+        set words to split_into_words(lowered)
+        set first to word_at(words and 0)
+
+        if string_equals(first and "done") == 1 || string_equals(first and "quit") == 1:
+            if unsaved == 1:
+                set ok to say("You have unsaved changes - say save to keep them, or done again to let them go.")
+                set unsaved to 2
+                continue
+            if unsaved == 2:
+                set ok to say("Left without saving.")
+                return 0
+            return 0
+
+        if string_equals(first and "show") == 1:
+            set ok to show_note_lines(lines)
+            continue
+
+        if string_equals(first and "help") == 1:
+            set ok to say("Say: add <words>, change <number> to <words>, remove <number>, show, save, done.")
+            continue
+
+        if string_equals(first and "save") == 1:
+            set text to join(lines and "\n")
+            set answer to vf_write(session and name and text)
+            if answer == 1:
+                set ok to say(f"Saved {name}.")
+                set unsaved to 0
+            else:
+                set ok to say(explain_refusal(answer))
+            continue
+
+        if string_equals(first and "add") == 1:
+            set spot to string_index_of(lowered and "add ")
+            set raw_len to string_length(raw)
+            set text to substring(raw and spot + 4 and raw_len - spot - 4)
+            set text to string_trim(concat(text and ""))
+            set ok to append_list(lines and text)
+            set ok to show_note_lines(lines)
+            set unsaved to 1
+            continue
+
+        if string_equals(first and "change") == 1:
+            set number to string_to_int(word_at(words and 1))
+            if number < 1 || number > length_list(lines):
+                set ok to say("Change which line? Say a line number, like: change 2 to better words.")
+                continue
+            set to_spot to string_index_of(lowered and " to ")
+            if to_spot < 0:
+                set ok to say("Change it to what? Say: change 2 to better words.")
+                continue
+            set raw_len to string_length(raw)
+            set text to substring(raw and to_spot + 4 and raw_len - to_spot - 4)
+            set text to string_trim(concat(text and ""))
+            set ok to set_list(lines and number - 1 and text)
+            set ok to show_note_lines(lines)
+            set unsaved to 1
+            continue
+
+        if string_equals(first and "remove") == 1:
+            set number to string_to_int(word_at(words and 1))
+            if number < 1 || number > length_list(lines):
+                set ok to say("Remove which line? Say a line number, like: remove 2.")
+                continue
+            set kept to remove_list(lines and number - 1)
+            set ok to show_note_lines(lines)
+            set unsaved to 1
+            continue
+
+        set ok to say("I did not follow. Say: add, change, remove, show, save or done.")
+    return 0
+
+### The notes app itself.
+define run_notes with session:
+    set ok to say("")
+    set ok to say("-- Notes --")
+    set here to session_place(session)
+    set ok to say(f"You are working in {vf_shown(here)}.")
+    set ok to say("Say: list, edit <name>, or done.")
+    repeat while 1 == 1:
+        set raw to ask("notes> ")
+        set lowered to string_to_lower(concat(raw and ""))
+        set words to split_into_words(lowered)
+        set first to word_at(words and 0)
+
+        if string_equals(first and "done") == 1 || string_equals(first and "quit") == 1 || string_equals(first and "exit") == 1:
+            set ok to say("Closing notes.")
+            return 0
+
+        if string_equals(first and "list") == 1 || string_equals(first and "show") == 1:
+            set names to vf_names(session and "")
+            set shown to 0
+            for each entry in names:
+                set name to concat(entry and "")
+                if vf_is_folder(session and name) == 0:
+                    set ok to say(f"  {name}")
+                    set shown to shown + 1
+            if shown == 0:
+                set ok to say("  (no notes here yet)")
+            continue
+
+        if string_equals(first and "edit") == 1 || string_equals(first and "open") == 1:
+            set name to words_from(words and 1)
+            if string_length(name) == 0:
+                set ok to say("Edit which note? Say: edit hello.")
+                continue
+            set ok to edit_note(session and name)
+            set ok to say("Say: list, edit <name>, or done.")
+            continue
+
+        if string_equals(first and "help") == 1:
+            set ok to say("Say: list, edit <name>, or done.")
+            continue
+
+        set ok to say("I did not follow. Say: list, edit <name>, or done.")
+    return 0

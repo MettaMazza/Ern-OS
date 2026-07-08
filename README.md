@@ -59,6 +59,10 @@ see everything Ern-OS understands, or read
   thousand times. Every path is checked at one fence (`the_disk.ep`), so
   nothing can reach outside the disk. Members can only change their own
   home; every action lands in a readable system log.
+- **Lived-in.** Several people share one machine (`add a person called
+  finn`), and it ships with apps: a **notes** editor, a numbered **files**
+  walker, a system **monitor**, and a first-day **welcome** tour that
+  greets the very first login. `what is running` shows the services.
 
 ## How it is built
 
@@ -89,8 +93,8 @@ transcript — twice, to prove nothing is forgotten between boots.
 
 ## The road ahead
 
-- **M2 — services and apps**: an init system, a notes editor, a file
-  manager, a system monitor; more people at once.
+- ~~**M1 — boot, login, shell**~~ done.
+- ~~**M2 — services, apps, people**~~ done.
 - **M3 — the desktop**: a full-screen terminal desktop.
 - **M4 — self-rebuild from within**: say `rebuild the system` inside
   Ern-OS and it recompiles itself with its own toolchain.

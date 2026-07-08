@@ -1,0 +1,78 @@
+# files — walking the folders with numbered doors.
+#
+# Userland app. Shows what is here as a numbered list; the person walks
+# by number. Runs in the foreground until they say done.
+
+### Show the current folder as a numbered list. Gives back the names.
+define show_doors with session:
+    set here to session_place(session)
+    set ok to say(f"You are in {vf_shown(here)}:")
+    set names to vf_names(session and "")
+    if length_list(names) == 0:
+        set ok to say("  (nothing here)")
+        return names
+    set n to length_list(names)
+    set i to 0
+    repeat while i < n:
+        set name to concat(get_list(names and i) and "")
+        if vf_is_folder(session and name) == 1:
+            set ok to say(f"  {i + 1}| {name}  (a folder)")
+        else:
+            set ok to say(f"  {i + 1}| {name}")
+        set i to i + 1
+    return names
+
+### The files app itself.
+define run_files with session:
+    set ok to say("")
+    set ok to say("-- Files --")
+    set ok to say("Say a number to open something, or: up, home, done.")
+    set names to show_doors(session)
+    repeat while 1 == 1:
+        set raw to ask("files> ")
+        set lowered to string_to_lower(concat(raw and ""))
+        set words to split_into_words(lowered)
+        set first to word_at(words and 0)
+
+        if string_equals(first and "done") == 1 || string_equals(first and "quit") == 1 || string_equals(first and "exit") == 1:
+            set ok to say("Closing files.")
+            return 0
+
+        if string_equals(first and "up") == 1 || string_equals(first and "back") == 1:
+            set answer to vf_go_up(session)
+            if answer == 4:
+                set ok to say("You are already at the top.")
+            set names to show_doors(session)
+            continue
+
+        if string_equals(first and "home") == 1:
+            set person to session_person(session)
+            set home to f"home/{person}"
+            set ok to session_move_to(session and home)
+            set names to show_doors(session)
+            continue
+
+        if string_equals(first and "help") == 1:
+            set ok to say("Say a number to open something, or: up, home, done.")
+            continue
+
+        # "3", "go 3" and "open 3" all mean door number 3.
+        set number_word to first
+        if string_equals(first and "go") == 1 || string_equals(first and "open") == 1:
+            set number_word to word_at(words and 1)
+        set number to string_to_int(number_word)
+        if number < 1 || number > length_list(names):
+            set ok to say("Say one of the numbers, or: up, home, done.")
+            continue
+        set name to concat(get_list(names and number - 1) and "")
+        if vf_is_folder(session and name) == 1:
+            set answer to vf_go(session and name)
+            set names to show_doors(session)
+        else:
+            set content to vf_read(session and name)
+            if string_length(content) == 0:
+                set ok to say(f"The note {name} is empty.")
+            else:
+                set ok to say(f"The note {name} says:")
+                set ok to say(content)
+    return 0

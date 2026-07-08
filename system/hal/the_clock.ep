@@ -21,7 +21,11 @@ define clock_stamp:
 define clock_time_of_day:
     return concat(format_time(now_seconds() and "%H:%M") and "")
 
-### Do nothing for a little while.
+### Do nothing for a little while. (sleep_ms only sleeps inside async
+### code; waiting on a channel that never speaks is a true wait.)
 define wait_milliseconds with ms:
-    set ok to sleep_ms(ms)
+    set nobody to create_channel()
+    set waiting to create_list()
+    set ok to append_list(waiting and nobody)
+    set ready to channel_select(waiting and ms)
     return 0

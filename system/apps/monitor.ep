@@ -1,0 +1,43 @@
+# monitor — how the system is doing, at a glance.
+#
+# Userland app. Not a conversation: it says its piece and hands the
+# shell straight back.
+
+### Say a stretch of seconds the way a person would.
+define pretty_duration with total:
+    if total < 60:
+        return f"{total} seconds"
+    set minutes to total / 60
+    set seconds to total % 60
+    if minutes < 60:
+        return f"{minutes} minutes and {seconds} seconds"
+    set hours to minutes / 60
+    set minutes_left to minutes % 60
+    return f"{hours} hours and {minutes_left} minutes"
+
+### The monitor app itself.
+define run_monitor with session and services:
+    set ok to say("")
+    set ok to say("-- System monitor --")
+    set ok to say(f"The machine     {machine_system_name()} ({machine_chip_name()})")
+    set ok to say(f"The clock       {clock_stamp()}")
+    set up to uptime_seconds()
+    set ok to say(f"Awake for       {pretty_duration(up)}")
+    set person to session_person(session)
+    set role to session_role(session)
+    set since to session_started(session)
+    set ok to say(f"At the keyboard {person} (a {role}), since {since}")
+    set people to account_count()
+    set ok to say(f"People known    {people}")
+    set tally to vf_tally()
+    set notes to get_list(tally and 0)
+    set folders to get_list(tally and 1)
+    set ok to say(f"On the disk     {notes} notes in {folders} folders")
+    set ok to say("Services")
+    set lines to service_lines(services)
+    if length_list(lines) == 0:
+        set ok to say("  (none)")
+    for each entry in lines:
+        set line to concat(entry and "")
+        set ok to say(f"  {line}")
+    return 0

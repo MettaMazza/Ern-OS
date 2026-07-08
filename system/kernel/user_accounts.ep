@@ -138,3 +138,22 @@ define account_role with name as Str:
 define account_count:
     set names to disk_list("system/registry/users")
     return length_list(names)
+
+### The names of everyone with an account.
+define list_account_names:
+    set names to create_list()
+    set found to disk_list("system/registry/users")
+    for each entry in found:
+        set name to concat(entry and "")
+        set ok to append_list(names and name)
+    return names
+
+### Remove a person's account. Their home folder and notes stay.
+### 1 = removed, 4 = no such person.
+define delete_account with name as Str:
+    if account_exists(name) == 0:
+        return 4
+    set record_path to account_record_path(name)
+    set ok to disk_remove_file(record_path)
+    set ok to log_note(f"account {name} removed")
+    return 1

@@ -19,6 +19,27 @@ Who are you?
 Your password? 
 Welcome back, maria.
 
+-- Welcome to Ern-OS --
+
+Hello, maria. This machine is yours: everything it knows
+lives in its own disk folder, works without any network, and
+every part of it - including the system itself - is written in
+plain English.
+
+You are standing in your home folder. Some things to try:
+
+  make a folder called letters
+  write a note called hello saying good morning
+  show my files
+  open notes        - a small editor for changing notes
+  open files        - walk your folders by number
+  open monitor      - how the system is doing
+  what is running   - the services working in the background
+  help              - everything Ern-OS understands
+
+Whenever you are done, say 'log out' - or 'shut down' to stop
+the machine. Nothing is ever forgotten between visits.
+
 Say 'help' if you would like to know what I understand.
 /home/maria > 
 You are standing in /home/maria.

@@ -5,6 +5,7 @@ start_ern_os
 test_understand_command
 test_user_accounts
 test_virtual_files
+test_services
 tests/tmp_run/
 
 # the living world of a running Ern-OS (personal data, never committed)

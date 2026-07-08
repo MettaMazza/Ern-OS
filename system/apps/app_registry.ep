@@ -1,0 +1,40 @@
+# app_registry — the apps Ern-OS ships with, and how to open one.
+#
+# Userland. Apps run in the foreground, in this same program: opening one
+# hands it the conversation until it says done. The shell asks this
+# registry by name.
+
+### Is this the name of an app?
+define is_app_name with name as Str:
+    if string_equals(name and "notes") == 1:
+        return 1
+    if string_equals(name and "files") == 1:
+        return 1
+    if string_equals(name and "monitor") == 1:
+        return 1
+    if string_equals(name and "welcome") == 1:
+        return 1
+    return 0
+
+### Lines describing every app, ready to show a person.
+define app_lines:
+    set lines to create_list()
+    set ok to append_list(lines and "notes    - change a note line by line")
+    set ok to append_list(lines and "files    - walk your folders by number")
+    set ok to append_list(lines and "monitor  - how the system is doing")
+    set ok to append_list(lines and "welcome  - the first-day tour")
+    return lines
+
+### Open an app by name and stay with it until it finishes.
+define launch_app with session and services and name as Str:
+    set person to session_person(session)
+    set ok to log_note(f"{person} opened {name}")
+    if string_equals(name and "notes") == 1:
+        return run_notes(session)
+    if string_equals(name and "files") == 1:
+        return run_files(session)
+    if string_equals(name and "monitor") == 1:
+        return run_monitor(session and services)
+    if string_equals(name and "welcome") == 1:
+        return run_welcome(session)
+    return 0

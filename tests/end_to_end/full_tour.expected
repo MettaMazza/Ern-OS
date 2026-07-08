@@ -1,0 +1,136 @@
+
+=====================================
+  Ern-OS
+  a small operating system written
+  entirely in plain-English Ernos
+=====================================
+  TIMESTAMP - on HOST
+
+This looks like the very first start, so let me prepare the disk...
+The disk is ready.
+
+Ern-OS needs to know one person before we begin - you.
+You will be the administrator of this machine.
+What should I call you? (letters and digits only) 
+Choose a password (at least 4 characters): 
+Pleased to meet you, maria. Your home is /home/maria.
+
+Who are you? 
+Your password? 
+Welcome back, maria.
+
+-- Welcome to Ern-OS --
+
+Hello, maria. This machine is yours: everything it knows
+lives in its own disk folder, works without any network, and
+every part of it - including the system itself - is written in
+plain English.
+
+You are standing in your home folder. Some things to try:
+
+  make a folder called letters
+  write a note called hello saying good morning
+  show my files
+  open notes        - a small editor for changing notes
+  open files        - walk your folders by number
+  open monitor      - how the system is doing
+  what is running   - the services working in the background
+  help              - everything Ern-OS understands
+
+Whenever you are done, say 'log out' - or 'shut down' to stop
+the machine. Nothing is ever forgotten between visits.
+
+Say 'help' if you would like to know what I understand.
+/home/maria > 
+Working in the background:
+  heartbeat  - running, SOME beats so far
+Apps you can open:
+  notes    - change a note line by line
+  files    - walk your folders by number
+  monitor  - how the system is doing
+  welcome  - the first-day tour
+/home/maria > 
+Choose a password for finn (at least 4 characters): 
+Welcome aboard, finn. Their home is /home/finn.
+/home/maria > 
+People with a place on this machine:
+  finn  (a member)
+  maria  (a admin)
+/home/maria > 
+
+-- Notes --
+You are working in /home/maria.
+Say: list, edit <name>, or done.
+notes> 
+Starting a fresh note called letter.
+  (the note is empty)
+Say: add <words>, change <number> to <words>, remove <number>, show, save, done.
+  line> 
+  1| Dear Finn
+  line> 
+  1| Dear Finn
+  2| Welcome to our machine
+  line> 
+  1| Dear Finn
+  2| Welcome to Ern-OS
+  line> 
+Saved letter.
+  line> 
+Say: list, edit <name>, or done.
+notes> 
+Closing notes.
+/home/maria > 
+The note letter says:
+Dear Finn
+Welcome to Ern-OS
+/home/maria > 
+Goodbye, maria.
+
+Who are you? 
+Your password? 
+Welcome back, finn.
+
+Say 'help' if you would like to know what I understand.
+/home/finn > 
+You are standing in /home/finn.
+/home/finn > 
+Saved the note diary.
+/home/finn > 
+The note diary says:
+day one
+/home/finn > 
+I am sorry - you are not allowed to change things there.
+/home/finn > 
+Goodbye, finn.
+
+Who are you? 
+Your password? 
+Welcome back, maria.
+
+Say 'help' if you would like to know what I understand.
+/home/maria > 
+
+-- System monitor --
+The machine     macos (arm64)
+The clock       TIMESTAMP
+Awake for A WHILE
+At the keyboard maria (a admin), since TIMESTAMP
+People known    2
+On the disk     6 notes in 6 folders
+Services
+  heartbeat  - running, SOME beats so far
+/home/maria > 
+The heartbeat service has stopped.
+/home/maria > 
+Working in the background:
+  heartbeat  - stopped
+Apps you can open:
+  notes    - change a note line by line
+  files    - walk your folders by number
+  monitor  - how the system is doing
+  welcome  - the first-day tour
+/home/maria > 
+The heartbeat service is running.
+/home/maria > 
+
+Ern-OS is going to sleep. Goodbye.

@@ -30,6 +30,30 @@ summer plans`. Names may use letters, digits, spaces, dots, dashes and
 underscores. Paths written with a slash work anywhere a name does:
 `read letters/hello`, `look in /home/maria`.
 
+## Apps and services
+
+| say | it means |
+|---|---|
+| `open notes` | a small editor — change a note line by line |
+| `open files` | walk your folders by number |
+| `open monitor` | how the system is doing |
+| `open welcome` | the first-day tour again |
+| `what is running` | services and the apps you can open |
+| `start the heartbeat service` | admins only |
+| `stop the heartbeat service` | admins only |
+
+Inside **notes**: `list`, `edit <name>`, then `add <words>`,
+`change <number> to <words>`, `remove <number>`, `show`, `save`, `done`.
+Inside **files**: say a door number to open it, or `up`, `home`, `done`.
+
+## People (admins only)
+
+| say | it means |
+|---|---|
+| `add a person called finn` | a new member (you choose their password) |
+| `list people` | everyone with an account |
+| `remove the person called finn` | their account goes; their notes stay |
+
 ## About you and the system
 
 | say | it means |

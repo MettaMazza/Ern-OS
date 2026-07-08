@@ -1,0 +1,129 @@
+# services — the things Ern-OS keeps an eye on in the background.
+#
+# Kernel layer. A service record is a small list — spot 0 the name,
+# spot 1 whether it is running, spot 2 the moment it started.
+#
+# HONESTY NOTE: these services are kept without real threads for now.
+# The Ernos runtime's garbage collector is not yet safe with threads —
+# a crypto_sha256 loop (as in every password check) crashes if any
+# spawned thread merely exists (bug filed in the language repo, with a
+# deterministic repro; the two-channel threaded design is in this
+# repo's git history, proven by probes, and can return the day the GC
+# is thread-safe). Until then the heartbeat "beats" are the seconds
+# since the service started — same meaning, no thread.
+#
+# Answer codes match the rest of the kernel:
+#   1 = done   4 = no such service   6 = already so
+
+### An empty table of services. Made once at boot.
+define create_service_table:
+    return create_list()
+
+### Find a service record by name. Gives back its spot, or -1.
+define find_service with services and name as Str:
+    set n to length_list(services)
+    set i to 0
+    repeat while i < n:
+        set record to get_list(services and i)
+        set record_name to concat(get_list(record and 0) and "")
+        if string_equals(record_name and name) == 1:
+            return i
+        set i to i + 1
+    return -1
+
+### Is this service running? 1 or 0; -1 when there is no such service.
+define service_is_running with services and name as Str:
+    set spot to find_service(services and name)
+    if spot < 0:
+        return 0 - 1
+    set record to get_list(services and spot)
+    return get_list(record and 1)
+
+### Start a service by name. 1 = started, 6 = already running,
+### 4 = no such service is known.
+define service_start with services and name as Str:
+    if string_equals(name and "heartbeat") == 0:
+        return 4
+    set spot to find_service(services and name)
+    if spot >= 0:
+        set record to get_list(services and spot)
+        if get_list(record and 1) == 1:
+            return 6
+        set ok to set_list(record and 1 and 1)
+        set ok to set_list(record and 2 and now_in_seconds())
+        set ok to log_note(f"service {name} started")
+        return 1
+    set record to create_list()
+    set ok to append_list(record and concat(name and ""))
+    set ok to append_list(record and 1)
+    set ok to append_list(record and now_in_seconds())
+    set ok to append_list(services and record)
+    set ok to log_note(f"service {name} started")
+    return 1
+
+### Ask a running service how it is doing (its beat count — one beat
+### a second since it started). -1 when it cannot answer.
+define service_ask with services and name as Str:
+    set spot to find_service(services and name)
+    if spot < 0:
+        return 0 - 1
+    set record to get_list(services and spot)
+    if get_list(record and 1) == 0:
+        return 0 - 1
+    set started to get_list(record and 2)
+    return now_in_seconds() - started
+
+### Stop a service. 1 = stopped, 4 = no such service, 6 = it was
+### not running.
+define service_stop with services and name as Str:
+    set spot to find_service(services and name)
+    if spot < 0:
+        return 4
+    set record to get_list(services and spot)
+    if get_list(record and 1) == 0:
+        return 6
+    set ok to set_list(record and 1 and 0)
+    set ok to log_note(f"service {name} stopped")
+    return 1
+
+### Lines describing every service, ready to show a person.
+define service_lines with services:
+    set lines to create_list()
+    set n to length_list(services)
+    set i to 0
+    repeat while i < n:
+        set record to get_list(services and i)
+        set name to concat(get_list(record and 0) and "")
+        if get_list(record and 1) == 1:
+            set beats to service_ask(services and name)
+            set line to f"{name}  - running, {beats} beats so far"
+            set ok to append_list(lines and line)
+        else:
+            set line to f"{name}  - stopped"
+            set ok to append_list(lines and line)
+        set i to i + 1
+    return lines
+
+# ---- The boot moment, for telling the uptime ----
+
+### Remember when this boot happened.
+define record_boot_moment:
+    if disk_exists("system/run") == 0:
+        set ok to disk_make_folder("system/run")
+    set moment to now_in_seconds()
+    set ok to disk_write("system/run/started" and f"{moment}")
+    return 0
+
+### When did this boot happen? Seconds since 1970, or 0 if unknown.
+define boot_moment:
+    set kept to disk_read("system/run/started")
+    if string_length(kept) == 0:
+        return 0
+    return string_to_int(kept)
+
+### How long has the system been up, in whole seconds?
+define uptime_seconds:
+    set started to boot_moment()
+    if started == 0:
+        return 0
+    return now_in_seconds() - started

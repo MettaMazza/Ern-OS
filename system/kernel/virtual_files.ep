@@ -161,6 +161,42 @@ define vf_go_up with session:
     set ok to session_move_to(session and parent)
     return 1
 
+### The plain names inside a folder, with no decoration.
+define vf_names with session and raw as Str:
+    set names to create_list()
+    set path to vf_resolve(session and raw)
+    if disk_is_folder(path) == 0:
+        return names
+    set found to disk_list(path)
+    for each entry in found:
+        set name to concat(entry and "")
+        set ok to append_list(names and name)
+    return names
+
+### Count every folder and note in the world. Gives back a list —
+### spot 0 is notes, spot 1 is folders.
+define vf_tally_walk with path as Str and tally:
+    set names to disk_list(path)
+    for each entry in names:
+        set name to concat(entry and "")
+        set spot to concat(path and "/")
+        set spot to concat(spot and name)
+        if disk_is_folder(spot) == 1:
+            set ok to set_list(tally and 1 and get_list(tally and 1) + 1)
+            set ok to vf_tally_walk(spot and tally)
+        else:
+            set ok to set_list(tally and 0 and get_list(tally and 0) + 1)
+    return 0
+
+define vf_tally:
+    set tally to create_list()
+    set ok to append_list(tally and 0)
+    set ok to append_list(tally and 0)
+    set ok to vf_tally_walk("home" and tally)
+    set ok to vf_tally_walk("system" and tally)
+    set ok to vf_tally_walk("apps" and tally)
+    return tally
+
 # ---- First boot ----
 
 ### Has this disk been prepared before?

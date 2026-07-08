@@ -22,17 +22,17 @@ if grep -rn "^import" system/ ; then
 fi
 # Only the hal may talk to the host machine.
 HOST_CALLS='\b(read_file|write_file|append_file|file_exists|is_directory|list_directory|create_directory|remove_file|remove_directory|rename_file|copy_file|run_command|get_env|set_env|read_line|display_string|now_ms|now_seconds|format_time|sleep_ms|net_connect|net_listen|ep_dlopen|ep_exit|ep_os_name|ep_arch_name)\b'
-if grep -rnE "$HOST_CALLS" system/kernel system/shell start_ern_os.ep ; then
+if grep -rnE "$HOST_CALLS" system/kernel system/shell system/apps start_ern_os.ep ; then
     echo "LINT FAIL: something above the hal talks to the host machine"
     FAIL=1
 fi
-# The shell may not reach past the kernel onto the disk.
-if grep -rnE '\bdisk_[a-z_]+\(' system/shell ; then
-    echo "LINT FAIL: the shell touches the disk directly"
+# The shell and the apps may not reach past the kernel onto the disk.
+if grep -rnE '\bdisk_[a-z_]+\(' system/shell system/apps ; then
+    echo "LINT FAIL: userland touches the disk directly"
     FAIL=1
 fi
 # Nothing above the hal may print for itself — everything goes through say/ask.
-if grep -rnE '^\s*display\b' system/kernel system/shell ; then
+if grep -rnE '^\s*display\b' system/kernel system/shell system/apps ; then
     echo "LINT FAIL: something above the hal prints for itself"
     FAIL=1
 fi
@@ -64,20 +64,26 @@ echo "== 3. end to end =="
 if [ ! -x ./start_ern_os ]; then
     bash build_ern_os.sh >/dev/null
 fi
-E2E=tests/tmp_run/e2e
-rm -rf "$E2E"
-mkdir -p "$E2E"
-MASK='s/[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/TIMESTAMP/g; s/- on [a-z0-9]+ \([a-z0-9_]+\)/- on HOST/'
-( cd "$E2E" && ../../../start_ern_os < ../../end_to_end/first_boot.commands ) 2>&1 \
-    | sed -E "$MASK" > "$E2E/first_boot.actual"
-if diff -u tests/end_to_end/first_boot.expected "$E2E/first_boot.actual" > "$E2E/first_boot.diff"; then
-    echo "PASS: first boot transcript"
-else
-    echo "E2E FAIL: first boot transcript differs (tests/tmp_run/e2e/first_boot.diff)"
-    head -20 "$E2E/first_boot.diff"
-    FAIL=1
-fi
-# Boot the same disk again: the note must still be there, the password still hashed.
+MASK='s/[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/TIMESTAMP/g; s/- on [a-z0-9]+ \([a-z0-9_]+\)/- on HOST/; s/[0-9]+ beats/SOME beats/g; s/Awake for .+/Awake for A WHILE/'
+run_transcript() {
+    name="$1"
+    dir="tests/tmp_run/e2e_$name"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    ( cd "$dir" && ../../../start_ern_os < "../../end_to_end/$name.commands" ) 2>&1 \
+        | sed -E "$MASK" > "$dir/$name.actual"
+    if diff -u "tests/end_to_end/$name.expected" "$dir/$name.actual" > "$dir/$name.diff"; then
+        echo "PASS: $name transcript"
+    else
+        echo "E2E FAIL: $name transcript differs (see $dir/$name.diff)"
+        head -20 "$dir/$name.diff"
+        FAIL=1
+    fi
+}
+run_transcript first_boot
+run_transcript full_tour
+# Boot the first disk again: the note must still be there, the password still hashed.
+E2E=tests/tmp_run/e2e_first_boot
 ( cd "$E2E" && ../../../start_ern_os < ../../end_to_end/second_boot.commands ) > "$E2E/second_boot.actual" 2>&1
 if grep -q "good morning world" "$E2E/second_boot.actual"; then
     echo "PASS: the note survived a restart"
@@ -85,7 +91,7 @@ else
     echo "E2E FAIL: the note did not survive a restart"
     FAIL=1
 fi
-if grep -rq "sunrise" "$E2E/disk"; then
+if grep -rq "sunrise" "$E2E/disk" || grep -rq "tide42" "tests/tmp_run/e2e_full_tour/disk"; then
     echo "E2E FAIL: a plain password reached the disk"
     FAIL=1
 else

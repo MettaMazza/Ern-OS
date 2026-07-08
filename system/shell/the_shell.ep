@@ -31,14 +31,14 @@ define login_flow:
 
 ### The conversation loop. Gives back 1 when the person asked to
 ### shut the whole system down, 0 when they only logged out.
-define shell_loop with session:
+define shell_loop with session and services:
     set ok to say("")
     set ok to say("Say 'help' if you would like to know what I understand.")
     repeat while 1 == 1:
         set here to session_place(session)
         set line to ask(f"{vf_shown(here)} > ")
         set cmd to understand_command(line)
-        set signal to perform_command(session and cmd)
+        set signal to perform_command(session and services and cmd)
         if signal == 1:
             return 0
         if signal == 2:

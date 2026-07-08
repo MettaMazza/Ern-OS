@@ -1,0 +1,28 @@
+# welcome — the first-day tour of Ern-OS.
+#
+# Userland app. Says its piece and hands the shell back.
+
+define run_welcome with session:
+    set person to session_person(session)
+    set ok to say("")
+    set ok to say("-- Welcome to Ern-OS --")
+    set ok to say("")
+    set ok to say(f"Hello, {person}. This machine is yours: everything it knows")
+    set ok to say("lives in its own disk folder, works without any network, and")
+    set ok to say("every part of it - including the system itself - is written in")
+    set ok to say("plain English.")
+    set ok to say("")
+    set ok to say("You are standing in your home folder. Some things to try:")
+    set ok to say("")
+    set ok to say("  make a folder called letters")
+    set ok to say("  write a note called hello saying good morning")
+    set ok to say("  show my files")
+    set ok to say("  open notes        - a small editor for changing notes")
+    set ok to say("  open files        - walk your folders by number")
+    set ok to say("  open monitor      - how the system is doing")
+    set ok to say("  what is running   - the services working in the background")
+    set ok to say("  help              - everything Ern-OS understands")
+    set ok to say("")
+    set ok to say("Whenever you are done, say 'log out' - or 'shut down' to stop")
+    set ok to say("the machine. Nothing is ever forgotten between visits.")
+    return 0

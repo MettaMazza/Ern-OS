@@ -1,0 +1,67 @@
+# test_services — does the service table keep an honest record?
+#
+# Compile from the repo root; RUN inside a scratch folder (the runner
+# does this) so the "disk" it creates is a throwaway one.
+
+import "string"
+import "fs"
+import "datetime"
+import "crypto"
+import "../system/hal/the_terminal.ep"
+import "../system/hal/the_disk.ep"
+import "../system/hal/the_clock.ep"
+import "../system/hal/the_machine.ep"
+import "../system/kernel/system_log.ep"
+import "../system/kernel/user_accounts.ep"
+import "../system/kernel/sessions.ep"
+import "../system/kernel/virtual_files.ep"
+import "../system/kernel/services.ep"
+
+define expect_number with label as Str and got and wanted:
+    if got == wanted:
+        display concat("PASS: " and label)
+        return 0
+    display concat("FAIL: " and label)
+    display f"  wanted {wanted} but got {got}"
+    return 1
+
+define main:
+    set bad to 0
+    set ok to vf_format_disk()
+    set services to create_service_table()
+
+    set bad to bad + expect_number("heartbeat starts" and service_start(services and "heartbeat") and 1)
+    set bad to bad + expect_number("starting twice refused" and service_start(services and "heartbeat") and 6)
+    set bad to bad + expect_number("unknown service refused" and service_start(services and "juggler") and 4)
+    set bad to bad + expect_number("running says so" and service_is_running(services and "heartbeat") and 1)
+
+    set first_ask to service_ask(services and "heartbeat")
+    if first_ask >= 0:
+        display "PASS: a fresh heartbeat answers"
+    else:
+        display "FAIL: a fresh heartbeat answers"
+        set bad to bad + 1
+
+    set ok to wait_milliseconds(1200)
+    set later_ask to service_ask(services and "heartbeat")
+    if later_ask > first_ask:
+        display "PASS: beats grow with time"
+    else:
+        display f"FAIL: beats grow with time (was {first_ask}, then {later_ask})"
+        set bad to bad + 1
+
+    set bad to bad + expect_number("stop works" and service_stop(services and "heartbeat") and 1)
+    set bad to bad + expect_number("stopping twice refused" and service_stop(services and "heartbeat") and 6)
+    set bad to bad + expect_number("stopped does not answer" and service_ask(services and "heartbeat") and 0 - 1)
+    set bad to bad + expect_number("restart works" and service_start(services and "heartbeat") and 1)
+
+    set ok to record_boot_moment()
+    set up to uptime_seconds()
+    if up >= 0:
+        display "PASS: uptime is sensible"
+    else:
+        display "FAIL: uptime is sensible"
+        set bad to bad + 1
+
+    display f"RESULT: {bad} failed"
+    return 0

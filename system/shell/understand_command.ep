@@ -71,6 +71,30 @@ define is_kind_word with w as Str:
         return 1
     if string_equals(w and "everything") == 1:
         return 1
+    if string_equals(w and "service") == 1:
+        return 1
+    if string_equals(w and "services") == 1:
+        return 1
+    if string_equals(w and "app") == 1:
+        return 1
+    if string_equals(w and "apps") == 1:
+        return 1
+    return 0
+
+### Does this sentence speak about a person or account?
+define speaks_of_people with words:
+    if index_of_word(words and "person") >= 0:
+        return 1
+    if index_of_word(words and "people") >= 0:
+        return 1
+    if index_of_word(words and "account") >= 0:
+        return 1
+    if index_of_word(words and "accounts") >= 0:
+        return 1
+    if index_of_word(words and "user") >= 0:
+        return 1
+    if index_of_word(words and "users") >= 0:
+        return 1
     return 0
 
 ### The word at a spot, as a clean string. "" past the end.
@@ -144,8 +168,16 @@ define verb_action with w as Str:
         return "where"
     if string_equals(w and "who") == 1:
         return "who"
-    if string_equals(w and "what") == 1 || string_equals(w and "time") == 1:
+    if string_equals(w and "what") == 1:
+        return "what"
+    if string_equals(w and "time") == 1:
         return "time"
+    if string_equals(w and "start") == 1:
+        return "start"
+    if string_equals(w and "stop") == 1:
+        return "stop"
+    if string_equals(w and "add") == 1 || string_equals(w and "invite") == 1:
+        return "add"
     if string_equals(w and "log") == 1 || string_equals(w and "logout") == 1 || string_equals(w and "sign") == 1:
         return "logout"
     if string_equals(w and "shut") == 1 || string_equals(w and "shutdown") == 1 || string_equals(w and "quit") == 1 || string_equals(w and "exit") == 1 || string_equals(w and "power") == 1:
@@ -226,10 +258,34 @@ define understand_command with line as Str:
         return make_command("who" and "" and "")
     if string_equals(verb and "time") == 1:
         return make_command("time" and "" and "")
+    if string_equals(verb and "what") == 1:
+        if index_of_word(words and "time") >= 0:
+            return make_command("time" and "" and "")
+        if index_of_word(words and "running") >= 0:
+            return make_command("running" and "" and "")
+        return make_command("unknown" and "what" and "")
     if string_equals(verb and "logout") == 1:
         return make_command("logout" and "" and "")
     if string_equals(verb and "shutdown") == 1:
         return make_command("shutdown" and "" and "")
+
+    # Sentences about people: add a person called finn, list people,
+    # remove the person called finn.
+    if speaks_of_people(words) == 1:
+        if string_equals(verb and "add") == 1 || string_equals(verb and "make") == 1:
+            return make_command("add_person" and pick_target(words and verb_spot) and "")
+        if string_equals(verb and "look") == 1:
+            return make_command("people" and "" and "")
+        if string_equals(verb and "remove") == 1:
+            return make_command("remove_person" and pick_target(words and verb_spot) and "")
+    if string_equals(verb and "add") == 1:
+        return make_command("add_person" and pick_target(words and verb_spot) and "")
+
+    # Services: start the heartbeat service, stop the heartbeat service.
+    if string_equals(verb and "start") == 1:
+        return make_command("start_service" and pick_target(words and verb_spot) and "")
+    if string_equals(verb and "stop") == 1:
+        return make_command("stop_service" and pick_target(words and verb_spot) and "")
 
     if string_equals(verb and "look") == 1:
         set in_spot to index_of_word(words and "in")
@@ -262,7 +318,15 @@ define understand_command with line as Str:
         return make_command("write" and target and text_part)
 
     if string_equals(verb and "read") == 1:
-        return make_command("read" and pick_target(words and verb_spot) and "")
+        set target to pick_target(words and verb_spot)
+        # "open notes" and "open files" name apps, but notes and files
+        # are also kind words - bring them back when nothing else is left.
+        if string_length(target) == 0:
+            if index_of_word(words and "notes") >= 0:
+                return make_command("read" and "notes" and "")
+            if index_of_word(words and "files") >= 0:
+                return make_command("read" and "files" and "")
+        return make_command("read" and target and "")
 
     if string_equals(verb and "remove") == 1:
         return make_command("remove" and pick_target(words and verb_spot) and "")
