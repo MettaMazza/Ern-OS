@@ -1,0 +1,63 @@
+# test_user_accounts — are people and their passwords handled safely?
+#
+# Compile from the repo root; RUN inside a scratch folder (the runner
+# does this) so the "disk" it creates is a throwaway one.
+
+import "string"
+import "fs"
+import "datetime"
+import "crypto"
+import "../system/hal/the_terminal.ep"
+import "../system/hal/the_disk.ep"
+import "../system/hal/the_clock.ep"
+import "../system/hal/the_machine.ep"
+import "../system/kernel/system_log.ep"
+import "../system/kernel/user_accounts.ep"
+import "../system/kernel/sessions.ep"
+import "../system/kernel/virtual_files.ep"
+
+define expect_number with label as Str and got and wanted:
+    if got == wanted:
+        display concat("PASS: " and label)
+        return 0
+    display concat("FAIL: " and label)
+    display f"  wanted {wanted} but got {got}"
+    return 1
+
+define main:
+    set bad to 0
+    set ok to vf_format_disk()
+
+    set bad to bad + expect_number("good account created" and create_account("maria" and "sunrise" and "admin") and 1)
+    set bad to bad + expect_number("account exists" and account_exists("maria") and 1)
+    set bad to bad + expect_number("same name twice refused" and create_account("maria" and "other" and "member") and 0)
+    set bad to bad + expect_number("short password refused" and create_account("pip" and "abc" and "member") and 0)
+    set bad to bad + expect_number("silly name refused" and create_account("ma/ria" and "sunrise" and "member") and 0)
+    set bad to bad + expect_number("spacey name refused" and create_account("ma ria" and "sunrise" and "member") and 0)
+
+    set bad to bad + expect_number("right password welcomed" and verify_login("maria" and "sunrise") and 1)
+    set bad to bad + expect_number("wrong password refused" and verify_login("maria" and "moonset") and 0)
+    set bad to bad + expect_number("unknown person refused" and verify_login("nobody" and "sunrise") and 0)
+
+    set role to account_role("maria")
+    if string_equals(role and "admin") == 1:
+        display "PASS: role remembered"
+    else:
+        display "FAIL: role remembered"
+        set bad to bad + 1
+
+    # No plain password may ever reach the disk.
+    set record to disk_read("system/registry/users/maria")
+    if string_contains(record and "sunrise") == 1:
+        display "FAIL: password stored in the open"
+        set bad to bad + 1
+    else:
+        display "PASS: no plain password on the disk"
+
+    # A record someone fiddled with must stop working.
+    set fiddled to string_replace(record and "secret is " and "secret is 00")
+    set ok to disk_write("system/registry/users/maria" and fiddled)
+    set bad to bad + expect_number("fiddled record refused" and verify_login("maria" and "sunrise") and 0)
+
+    display f"RESULT: {bad} failed"
+    return 0

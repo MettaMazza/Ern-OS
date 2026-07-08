@@ -1,0 +1,67 @@
+# test_understand_command — does the shell understand people correctly?
+#
+# Table-driven: each line below is one sentence and what it should mean.
+# Run from the repo root (bare imports resolve against ./stdlib).
+
+import "string"
+import "../system/shell/understand_command.ep"
+
+define failures_so_far with bump:
+    return bump
+
+define expect with line as Str and action as Str and target as Str and extra as Str:
+    set cmd to understand_command(line)
+    set got_action to command_action(cmd)
+    set got_target to command_target(cmd)
+    set got_extra to command_extra(cmd)
+    set good to 1
+    if string_equals(got_action and action) == 0:
+        set good to 0
+    if string_equals(got_target and target) == 0:
+        set good to 0
+    if string_equals(got_extra and extra) == 0:
+        set good to 0
+    if good == 1:
+        display concat("PASS: " and line)
+        return 0
+    display concat("FAIL: " and line)
+    display f"  wanted  action [{action}] target [{target}] extra [{extra}]"
+    display f"  but got action [{got_action}] target [{got_target}] extra [{got_extra}]"
+    return 1
+
+define main:
+    set bad to 0
+    set bad to bad + expect("make a folder called letters" and "make_folder" and "letters" and "")
+    set bad to bad + expect("please make a folder called summer plans" and "make_folder" and "summer plans" and "")
+    set bad to bad + expect("create a new folder called ideas" and "make_folder" and "ideas" and "")
+    set bad to bad + expect("write a note called hello saying good morning" and "write" and "hello" and "good morning")
+    set bad to bad + expect("write a note called hello SAYING Good Morning" and "write" and "hello" and "Good Morning")
+    set bad to bad + expect("make a note called empty" and "write" and "empty" and "")
+    set bad to bad + expect("show my files" and "look" and "" and "")
+    set bad to bad + expect("ls" and "look" and "" and "")
+    set bad to bad + expect("look in letters" and "look" and "letters" and "")
+    set bad to bad + expect("see everything" and "look" and "" and "")
+    set bad to bad + expect("go to letters" and "go" and "letters" and "")
+    set bad to bad + expect("cd letters" and "go" and "letters" and "")
+    set bad to bad + expect("go home" and "go_home" and "" and "")
+    set bad to bad + expect("go up" and "go_up" and "" and "")
+    set bad to bad + expect("go back" and "go_up" and "" and "")
+    set bad to bad + expect("where am i" and "where" and "" and "")
+    set bad to bad + expect("who am i" and "who" and "" and "")
+    set bad to bad + expect("what time is it" and "time" and "" and "")
+    set bad to bad + expect("read hello" and "read" and "hello" and "")
+    set bad to bad + expect("open the note called hello" and "read" and "hello" and "")
+    set bad to bad + expect("remove hello" and "remove" and "hello" and "")
+    set bad to bad + expect("delete the folder called letters" and "remove" and "letters" and "")
+    set bad to bad + expect("move hello to greeting" and "move" and "hello" and "greeting")
+    set bad to bad + expect("rename hello to greeting" and "move" and "hello" and "greeting")
+    set bad to bad + expect("log out" and "logout" and "" and "")
+    set bad to bad + expect("sign out" and "logout" and "" and "")
+    set bad to bad + expect("shut down" and "shutdown" and "" and "")
+    set bad to bad + expect("power off" and "shutdown" and "" and "")
+    set bad to bad + expect("frobnicate the whatsit" and "unknown" and "frobnicate" and "")
+    set bad to bad + expect("" and "nothing" and "" and "")
+    set bad to bad + expect("   " and "nothing" and "" and "")
+    set bad to bad + expect("help" and "help" and "" and "")
+    display f"RESULT: {bad} failed"
+    return 0

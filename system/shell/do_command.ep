@@ -1,0 +1,175 @@
+# do_command — carrying out what the person asked for.
+#
+# Userland. Takes the command that understand_command produced, asks the
+# kernel to do the work, and answers in plain English. Every action that
+# changes something is written to the system log.
+#
+# perform_command gives back a signal:
+#   0 = carry on    1 = the person logged out    2 = shut the system down
+
+### Turn a kernel answer code into a sentence a person can act on.
+define explain_refusal with code:
+    if code == 2:
+        return "I am sorry - you are not allowed to change things there."
+    if code == 3:
+        return "That name will not do. Names may use letters, digits, spaces, dots, dashes and underscores."
+    if code == 4:
+        return "There is no such place here."
+    if code == 5:
+        return "That folder still has things inside it. Empty it first."
+    if code == 6:
+        return "There is already something with that name."
+    return "Something unexpected went wrong."
+
+define perform_command with session and cmd:
+    set action to command_action(cmd)
+    set target to command_target(cmd)
+    set extra to command_extra(cmd)
+    set person to session_person(session)
+
+    if string_equals(action and "nothing") == 1:
+        return 0
+
+    if string_equals(action and "unknown") == 1:
+        set ok to say(f"I do not know how to '{target}'. Say 'help' to see what I understand.")
+        return 0
+
+    if string_equals(action and "help") == 1:
+        set ok to show_help()
+        return 0
+
+    if string_equals(action and "where") == 1:
+        set here to session_place(session)
+        set ok to say(f"You are standing in {vf_shown(here)}.")
+        return 0
+
+    if string_equals(action and "who") == 1:
+        set role to session_role(session)
+        set since to session_started(session)
+        set ok to say(f"You are {person}, a {role} here, signed in since {since}.")
+        return 0
+
+    if string_equals(action and "time") == 1:
+        set stamp to clock_stamp()
+        set ok to say(f"It is {stamp}.")
+        return 0
+
+    if string_equals(action and "look") == 1:
+        set entries to vf_look(session and target)
+        set spot to vf_resolve(session and target)
+        if vf_is_folder(session and target) == 0:
+            set ok to say("There is no such folder here.")
+            return 0
+        if length_list(entries) == 0:
+            set ok to say(f"{vf_shown(spot)} is empty.")
+            return 0
+        set ok to say(f"Inside {vf_shown(spot)}:")
+        for each entry in entries:
+            set line to concat(entry and "")
+            set ok to say(f"  {line}")
+        return 0
+
+    if string_equals(action and "go_home") == 1:
+        set home to f"home/{person}"
+        set ok to session_move_to(session and home)
+        set ok to say(f"You are back in {vf_shown(home)}.")
+        return 0
+
+    if string_equals(action and "go_up") == 1:
+        set answer to vf_go_up(session)
+        if answer == 1:
+            set here to session_place(session)
+            set ok to say(f"You are now in {vf_shown(here)}.")
+        else:
+            set ok to say("You are already at the top.")
+        return 0
+
+    if string_equals(action and "go") == 1:
+        if string_length(target) == 0:
+            set ok to say("Go where? Try 'go to letters' or 'go home'.")
+            return 0
+        set answer to vf_go(session and target)
+        if answer == 1:
+            set here to session_place(session)
+            set ok to say(f"You are now in {vf_shown(here)}.")
+        else:
+            set ok to say(explain_refusal(answer))
+        return 0
+
+    if string_equals(action and "make_folder") == 1:
+        if string_length(target) == 0:
+            set ok to say("Make a folder called what? Try 'make a folder called letters'.")
+            return 0
+        set answer to vf_make_folder(session and target)
+        if answer == 1:
+            set ok to say(f"Made a folder called {target}.")
+            set ok to log_note(f"{person} made folder {target}")
+        else:
+            set ok to say(explain_refusal(answer))
+        return 0
+
+    if string_equals(action and "write") == 1:
+        if string_length(target) == 0:
+            set ok to say("Write a note called what? Try 'write a note called hello saying good morning'.")
+            return 0
+        set answer to vf_write(session and target and extra)
+        if answer == 1:
+            set ok to say(f"Saved the note {target}.")
+            set ok to log_note(f"{person} wrote note {target}")
+        else:
+            set ok to say(explain_refusal(answer))
+        return 0
+
+    if string_equals(action and "read") == 1:
+        if string_length(target) == 0:
+            set ok to say("Read what? Try 'read hello'.")
+            return 0
+        if vf_exists(session and target) == 0:
+            set ok to say("There is no note with that name here.")
+            return 0
+        if vf_is_folder(session and target) == 1:
+            set ok to say(f"{target} is a folder. Say 'look in {target}' to see inside it.")
+            return 0
+        set content to vf_read(session and target)
+        if string_length(content) == 0:
+            set ok to say(f"The note {target} is empty.")
+            return 0
+        set ok to say(f"The note {target} says:")
+        set ok to say(content)
+        return 0
+
+    if string_equals(action and "remove") == 1:
+        if string_length(target) == 0:
+            set ok to say("Remove what? Try 'remove hello'.")
+            return 0
+        set answer to vf_remove(session and target)
+        if answer == 1:
+            set ok to say(f"Removed {target}.")
+            set ok to log_note(f"{person} removed {target}")
+        else:
+            set ok to say(explain_refusal(answer))
+        return 0
+
+    if string_equals(action and "move") == 1:
+        if string_length(target) == 0 || string_length(extra) == 0:
+            set ok to say("Move what to where? Try 'move hello to greeting'.")
+            return 0
+        set answer to vf_move(session and target and extra)
+        if answer == 1:
+            set ok to say(f"Moved {target} to {extra}.")
+            set ok to log_note(f"{person} moved {target} to {extra}")
+        else:
+            set ok to say(explain_refusal(answer))
+        return 0
+
+    if string_equals(action and "logout") == 1:
+        set ok to log_note(f"{person} logged out")
+        set ok to say(f"Goodbye, {person}.")
+        return 1
+
+    if string_equals(action and "shutdown") == 1:
+        set ok to log_note(f"{person} shut the system down")
+        return 2
+
+    set ok to say(f"I do not know how to '{action}' yet.")
+    return 0

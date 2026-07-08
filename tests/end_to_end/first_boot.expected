@@ -1,0 +1,57 @@
+
+=====================================
+  Ern-OS
+  a small operating system written
+  entirely in plain-English Ernos
+=====================================
+  TIMESTAMP - on HOST
+
+This looks like the very first start, so let me prepare the disk...
+The disk is ready.
+
+Ern-OS needs to know one person before we begin - you.
+You will be the administrator of this machine.
+What should I call you? (letters and digits only) 
+Choose a password (at least 4 characters): 
+Pleased to meet you, maria. Your home is /home/maria.
+
+Who are you? 
+Your password? 
+Welcome back, maria.
+
+Say 'help' if you would like to know what I understand.
+/home/maria > 
+You are standing in /home/maria.
+/home/maria > 
+Made a folder called letters.
+/home/maria > 
+You are now in /home/maria/letters.
+/home/maria/letters > 
+Saved the note hello.
+/home/maria/letters > 
+The note hello says:
+good morning world
+/home/maria/letters > 
+Inside /home/maria/letters:
+  hello
+/home/maria/letters > 
+You are now in /home/maria.
+/home/maria > 
+Inside /home/maria:
+  letters  (a folder)
+/home/maria > 
+You are maria, a admin here, signed in since TIMESTAMP.
+/home/maria > 
+Goodbye, maria.
+
+Who are you? 
+Your password? 
+Welcome back, maria.
+
+Say 'help' if you would like to know what I understand.
+/home/maria > 
+The note letters/hello says:
+good morning world
+/home/maria > 
+
+Ern-OS is going to sleep. Goodbye.

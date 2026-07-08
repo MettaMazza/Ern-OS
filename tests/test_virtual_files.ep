@@ -1,0 +1,80 @@
+# test_virtual_files — do the folders, permissions and fences hold?
+#
+# Compile from the repo root; RUN inside a scratch folder (the runner
+# does this) so the "disk" it creates is a throwaway one.
+
+import "string"
+import "fs"
+import "datetime"
+import "crypto"
+import "../system/hal/the_terminal.ep"
+import "../system/hal/the_disk.ep"
+import "../system/hal/the_clock.ep"
+import "../system/hal/the_machine.ep"
+import "../system/kernel/system_log.ep"
+import "../system/kernel/user_accounts.ep"
+import "../system/kernel/sessions.ep"
+import "../system/kernel/virtual_files.ep"
+
+define expect_number with label as Str and got and wanted:
+    if got == wanted:
+        display concat("PASS: " and label)
+        return 0
+    display concat("FAIL: " and label)
+    display f"  wanted {wanted} but got {got}"
+    return 1
+
+define expect_text with label as Str and got as Str and wanted as Str:
+    if string_equals(got and wanted) == 1:
+        display concat("PASS: " and label)
+        return 0
+    display concat("FAIL: " and label)
+    display f"  wanted [{wanted}] but got [{got}]"
+    return 1
+
+define main:
+    set bad to 0
+    set ok to vf_format_disk()
+    set bad to bad + expect_number("disk formats" and vf_disk_is_formatted() and 1)
+
+    # The fence around the disk itself.
+    set bad to bad + expect_number("dotdot path refused" and disk_path_is_safe("../outside") and 0)
+    set bad to bad + expect_number("hidden dotdot refused" and disk_path_is_safe("home/../../outside") and 0)
+    set bad to bad + expect_number("absolute path refused" and disk_path_is_safe("/etc") and 0)
+    set bad to bad + expect_number("empty path refused" and disk_path_is_safe("") and 0)
+    set bad to bad + expect_number("strange characters refused" and disk_path_is_safe("home/na*me") and 0)
+    set bad to bad + expect_number("friendly path accepted" and disk_path_is_safe("home/maria/my letters") and 1)
+
+    # An admin and a member.
+    set admin to begin_session("boss" and "admin")
+    set ok to disk_make_folder("home/boss")
+    set member to begin_session("kid" and "member")
+    set ok to disk_make_folder("home/kid")
+
+    # Making, walking, writing, reading.
+    set bad to bad + expect_number("admin makes a folder" and vf_make_folder(admin and "letters") and 1)
+    set bad to bad + expect_number("same folder twice refused" and vf_make_folder(admin and "letters") and 6)
+    set bad to bad + expect_number("admin steps in" and vf_go(admin and "letters") and 1)
+    set bad to bad + expect_text("place follows" and session_place(admin) and "home/boss/letters")
+    set bad to bad + expect_number("write a note" and vf_write(admin and "hello" and "good morning") and 1)
+    set bad to bad + expect_text("read it back" and vf_read(admin and "hello") and "good morning")
+    set bad to bad + expect_number("remove full folder refused" and vf_remove(admin and "/home/boss/letters") and 5)
+    set bad to bad + expect_number("step up" and vf_go_up(admin) and 1)
+    set bad to bad + expect_text("place is home again" and session_place(admin) and "home/boss")
+
+    # The permission fence.
+    set bad to bad + expect_number("member writes at home" and vf_write(member and "diary" and "dear diary") and 1)
+    set bad to bad + expect_number("member peeks into bosses home" and vf_write(member and "/home/boss/sneaky" and "hi") and 2)
+    set bad to bad + expect_number("member touches the system" and vf_write(member and "/system/naughty" and "x") and 2)
+    set bad to bad + expect_number("member escapes the disk" and vf_write(member and "/../outside" and "x") and 3)
+    set bad to bad + expect_number("admin writes anywhere" and vf_write(admin and "/system/allowed" and "fine") and 1)
+
+    # Moving and removing.
+    set bad to bad + expect_number("move a note" and vf_move(admin and "/home/boss/letters/hello" and "/home/boss/letters/greeting") and 1)
+    set bad to bad + expect_number("moved note gone from old name" and vf_exists(admin and "/home/boss/letters/hello") and 0)
+    set bad to bad + expect_number("remove the note" and vf_remove(admin and "/home/boss/letters/greeting") and 1)
+    set bad to bad + expect_number("now empty folder removes" and vf_remove(admin and "/home/boss/letters") and 1)
+    set bad to bad + expect_number("removing whats gone" and vf_remove(admin and "/home/boss/letters") and 4)
+
+    display f"RESULT: {bad} failed"
+    return 0

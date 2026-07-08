@@ -1,0 +1,278 @@
+# understand_command — turning a typed sentence into something Ern-OS can do.
+#
+# Userland. People talk to Ern-OS in plain English: "make a folder called
+# letters", "show my files", "write a note called hello saying good morning".
+# This file turns such a sentence into a small command — a list of three
+# strings: what to do, what to do it to, and any extra words.
+#
+# The approach is the same as the Ernos compiler's own lexer: split into
+# words, drop the padding, recognise the verb, then pick out the details.
+
+### Build a command. Spot 0 is the action, spot 1 the target, spot 2 extra.
+define make_command with action as Str and target as Str and extra as Str:
+    set cmd to create_list()
+    set ok to append_list(cmd and concat(action and ""))
+    set ok to append_list(cmd and concat(target and ""))
+    set ok to append_list(cmd and concat(extra and ""))
+    return cmd
+
+define command_action with cmd:
+    return concat(get_list(cmd and 0) and "")
+
+define command_target with cmd:
+    return concat(get_list(cmd and 1) and "")
+
+define command_extra with cmd:
+    return concat(get_list(cmd and 2) and "")
+
+### Words that pad a sentence out without changing what it asks for.
+define is_filler with w as Str:
+    if string_equals(w and "please") == 1:
+        return 1
+    if string_equals(w and "kindly") == 1:
+        return 1
+    if string_equals(w and "just") == 1:
+        return 1
+    if string_equals(w and "the") == 1:
+        return 1
+    if string_equals(w and "a") == 1:
+        return 1
+    if string_equals(w and "an") == 1:
+        return 1
+    if string_equals(w and "my") == 1:
+        return 1
+    if string_equals(w and "me") == 1:
+        return 1
+    if string_equals(w and "some") == 1:
+        return 1
+    if string_equals(w and "you") == 1:
+        return 1
+    if string_equals(w and "can") == 1:
+        return 1
+    if string_equals(w and "could") == 1:
+        return 1
+    if string_equals(w and "would") == 1:
+        return 1
+    return 0
+
+### Words that name a kind of thing rather than a particular thing.
+define is_kind_word with w as Str:
+    if string_equals(w and "note") == 1:
+        return 1
+    if string_equals(w and "notes") == 1:
+        return 1
+    if string_equals(w and "file") == 1:
+        return 1
+    if string_equals(w and "files") == 1:
+        return 1
+    if string_equals(w and "folder") == 1:
+        return 1
+    if string_equals(w and "folders") == 1:
+        return 1
+    if string_equals(w and "everything") == 1:
+        return 1
+    return 0
+
+### The word at a spot, as a clean string. "" past the end.
+define word_at with words and idx:
+    if idx >= length_list(words):
+        return ""
+    if idx < 0:
+        return ""
+    return concat(get_list(words and idx) and "")
+
+### Where a word sits in the list, or -1 when it is not there.
+define index_of_word with words and target as Str:
+    set n to length_list(words)
+    set i to 0
+    repeat while i < n:
+        set w to word_at(words and i)
+        if string_equals(w and target) == 1:
+            return i
+        set i to i + 1
+    return -1
+
+### Join the words from one spot up to (not including) another,
+### skipping filler, into one name like "summer plans".
+define words_between with words and start and stop:
+    set n to length_list(words)
+    set finish to stop
+    if finish > n:
+        set finish to n
+    set picked to create_list()
+    set i to start
+    repeat while i < finish:
+        set w to word_at(words and i)
+        if is_filler(w) == 0:
+            set ok to append_list(picked and w)
+        set i to i + 1
+    return join(picked and " ")
+
+### Join all the words from one spot to the end, skipping filler.
+define words_from with words and start:
+    return words_between(words and start and length_list(words))
+
+### Split a lowered sentence into its words, dropping empty pieces.
+define split_into_words with text as Str:
+    set words to create_list()
+    set pieces to split(text and " ")
+    for each piece in pieces:
+        set w to string_trim(concat(piece and ""))
+        if string_length(w) > 0:
+            set ok to append_list(words and w)
+    return words
+
+### What canonical action does this verb ask for? "" when it is no verb.
+define verb_action with w as Str:
+    if string_equals(w and "look") == 1 || string_equals(w and "show") == 1 || string_equals(w and "list") == 1 || string_equals(w and "see") == 1 || string_equals(w and "ls") == 1:
+        return "look"
+    if string_equals(w and "make") == 1 || string_equals(w and "create") == 1 || string_equals(w and "new") == 1:
+        return "make"
+    if string_equals(w and "go") == 1 || string_equals(w and "enter") == 1 || string_equals(w and "cd") == 1 || string_equals(w and "visit") == 1:
+        return "go"
+    if string_equals(w and "write") == 1 || string_equals(w and "save") == 1:
+        return "write"
+    if string_equals(w and "read") == 1 || string_equals(w and "open") == 1:
+        return "read"
+    if string_equals(w and "remove") == 1 || string_equals(w and "delete") == 1 || string_equals(w and "erase") == 1 || string_equals(w and "trash") == 1:
+        return "remove"
+    if string_equals(w and "move") == 1 || string_equals(w and "rename") == 1:
+        return "move"
+    if string_equals(w and "help") == 1:
+        return "help"
+    if string_equals(w and "where") == 1:
+        return "where"
+    if string_equals(w and "who") == 1:
+        return "who"
+    if string_equals(w and "what") == 1 || string_equals(w and "time") == 1:
+        return "time"
+    if string_equals(w and "log") == 1 || string_equals(w and "logout") == 1 || string_equals(w and "sign") == 1:
+        return "logout"
+    if string_equals(w and "shut") == 1 || string_equals(w and "shutdown") == 1 || string_equals(w and "quit") == 1 || string_equals(w and "exit") == 1 || string_equals(w and "power") == 1:
+        return "shutdown"
+    return ""
+
+### Pick out the name that follows "called" or "named" — or, failing
+### that, everything after the verb that is not padding or a kind word.
+define pick_target with words and verb_spot:
+    set called_spot to index_of_word(words and "called")
+    if called_spot < 0:
+        set called_spot to index_of_word(words and "named")
+    if called_spot >= 0:
+        return words_from(words and called_spot + 1)
+    set n to length_list(words)
+    set picked to create_list()
+    set i to verb_spot + 1
+    repeat while i < n:
+        set w to word_at(words and i)
+        set skip to is_filler(w)
+        if is_kind_word(w) == 1:
+            set skip to 1
+        if string_equals(w and "in") == 1 || string_equals(w and "to") == 1 || string_equals(w and "into") == 1:
+            set skip to 1
+        if skip == 0:
+            set ok to append_list(picked and w)
+        set i to i + 1
+    return join(picked and " ")
+
+### Turn one typed line into a command.
+define understand_command with line as Str:
+    set raw to string_trim(concat(line and ""))
+    if string_length(raw) == 0:
+        return make_command("nothing" and "" and "")
+
+    # Whatever follows "saying" is kept exactly as typed.
+    set text_part to ""
+    set head to raw
+    set lowered_all to string_to_lower(raw)
+    set saying_spot to string_index_of(lowered_all and " saying ")
+    if saying_spot >= 0:
+        set text_start to saying_spot + 8
+        set raw_len to string_length(raw)
+        set text_part to substring(raw and text_start and raw_len - text_start)
+        set text_part to string_trim(concat(text_part and ""))
+        set head to substring(raw and 0 and saying_spot)
+
+    set lowered to string_to_lower(concat(head and ""))
+    set words to split_into_words(lowered)
+    if length_list(words) == 0:
+        return make_command("nothing" and "" and "")
+
+    # Find the verb: the first word that names an action.
+    set n to length_list(words)
+    set verb to ""
+    set verb_spot to -1
+    set i to 0
+    repeat while i < n:
+        set w to word_at(words and i)
+        if is_filler(w) == 0:
+            set found to verb_action(w)
+            if string_length(found) > 0:
+                set verb to found
+                set verb_spot to i
+                break
+            # A sentence that opens with something that is not padding
+            # and not a verb is not understood.
+            return make_command("unknown" and w and "")
+        set i to i + 1
+    if verb_spot < 0:
+        return make_command("nothing" and "" and "")
+
+    if string_equals(verb and "help") == 1:
+        return make_command("help" and "" and "")
+    if string_equals(verb and "where") == 1:
+        return make_command("where" and "" and "")
+    if string_equals(verb and "who") == 1:
+        return make_command("who" and "" and "")
+    if string_equals(verb and "time") == 1:
+        return make_command("time" and "" and "")
+    if string_equals(verb and "logout") == 1:
+        return make_command("logout" and "" and "")
+    if string_equals(verb and "shutdown") == 1:
+        return make_command("shutdown" and "" and "")
+
+    if string_equals(verb and "look") == 1:
+        set in_spot to index_of_word(words and "in")
+        if in_spot >= 0:
+            set place to words_from(words and in_spot + 1)
+            return make_command("look" and place and "")
+        return make_command("look" and pick_target(words and verb_spot) and "")
+
+    if string_equals(verb and "go") == 1:
+        set next_word to word_at(words and verb_spot + 1)
+        if string_equals(next_word and "to") == 1 || string_equals(next_word and "into") == 1:
+            set place to words_from(words and verb_spot + 2)
+            return make_command("go" and place and "")
+        set place to words_from(words and verb_spot + 1)
+        if string_equals(place and "home") == 1:
+            return make_command("go_home" and "" and "")
+        if string_equals(place and "up") == 1 || string_equals(place and "back") == 1:
+            return make_command("go_up" and "" and "")
+        return make_command("go" and place and "")
+
+    if string_equals(verb and "make") == 1:
+        set target to pick_target(words and verb_spot)
+        set note_spot to index_of_word(words and "note")
+        if note_spot >= 0:
+            return make_command("write" and target and text_part)
+        return make_command("make_folder" and target and "")
+
+    if string_equals(verb and "write") == 1:
+        set target to pick_target(words and verb_spot)
+        return make_command("write" and target and text_part)
+
+    if string_equals(verb and "read") == 1:
+        return make_command("read" and pick_target(words and verb_spot) and "")
+
+    if string_equals(verb and "remove") == 1:
+        return make_command("remove" and pick_target(words and verb_spot) and "")
+
+    if string_equals(verb and "move") == 1:
+        set to_spot to index_of_word(words and "to")
+        if to_spot < 0:
+            return make_command("move" and words_from(words and verb_spot + 1) and "")
+        set target to words_between(words and verb_spot + 1 and to_spot)
+        set destination to words_from(words and to_spot + 1)
+        return make_command("move" and target and destination)
+
+    return make_command("unknown" and verb and "")

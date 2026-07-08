@@ -1,0 +1,142 @@
+# the_disk — how Ern-OS remembers things when the power goes off.
+#
+# This is part of the hardware abstraction layer. It is the ONLY place in
+# Ern-OS that is allowed to touch the host machine's real filesystem, and
+# the only file that knows the whole Ern-OS world lives inside the "disk"
+# folder. Every path given to these functions is disk-relative, like
+# "home/maria/letters". On bare metal, this file would be rewritten to
+# drive a block device — and nothing above it would change.
+#
+# the_disk is also the security boundary: every path is checked here, so
+# nothing above this layer can ever reach outside the disk folder.
+
+### Decide whether one file-or-folder name is acceptable.
+### Names may use letters, digits, spaces, dots, dashes and underscores —
+### and may never be empty, "." or "..".
+define disk_name_is_safe with name as Str:
+    set n to concat(name and "")
+    set len to string_length(n)
+    if len == 0:
+        return 0
+    if string_equals(n and ".") == 1:
+        return 0
+    if string_equals(n and "..") == 1:
+        return 0
+    set i to 0
+    repeat while i < len:
+        # get_character gives the character's number code:
+        # 32 is space, 45 is dash, 46 is dot, 95 is underscore.
+        set ch to get_character(n and i)
+        set ok to 0
+        if is_alphanumeric(ch) == 1:
+            set ok to 1
+        if ch == 32:
+            set ok to 1
+        if ch == 45:
+            set ok to 1
+        if ch == 46:
+            set ok to 1
+        if ch == 95:
+            set ok to 1
+        if ok == 0:
+            return 0
+        set i to i + 1
+    return 1
+
+### Decide whether a whole disk-relative path is acceptable.
+### A path is words joined by "/" — never starting with "/", never
+### containing "..", never empty.
+define disk_path_is_safe with path as Str:
+    set p to concat(path and "")
+    if string_length(p) == 0:
+        return 0
+    set parts to split(p and "/")
+    for each part in parts:
+        if disk_name_is_safe(part) == 0:
+            return 0
+    return 1
+
+### Turn a disk-relative path into a real host path. Internal only.
+define disk_location with path as Str:
+    return concat("disk/" and path)
+
+### Read the whole contents of a file. Gives back "" if it is missing
+### or the path is not safe.
+define disk_read with path as Str:
+    if disk_path_is_safe(path) == 0:
+        return ""
+    return concat(read_file(disk_location(path)) and "")
+
+### Write content into a file, replacing what was there.
+### Gives back 1 when it worked, 0 when the path was refused.
+define disk_write with path as Str and content as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    set ok to write_file(disk_location(path) and content)
+    return 1
+
+### Add content to the end of a file.
+define disk_append with path as Str and content as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    set ok to append_file(disk_location(path) and content)
+    return 1
+
+### Does anything live at this path?
+define disk_exists with path as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    return file_exists(disk_location(path))
+
+### Is the thing at this path a folder?
+define disk_is_folder with path as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    return is_directory(disk_location(path))
+
+### List the names inside a folder, as clean strings.
+define disk_list with path as Str:
+    set names to create_list()
+    if disk_path_is_safe(path) == 0:
+        return names
+    set raw to list_directory(disk_location(path))
+    for each entry in raw:
+        set name to concat(entry and "")
+        set ok to append_list(names and name)
+    return names
+
+### Make a new folder.
+define disk_make_folder with path as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    set ok to create_directory(disk_location(path))
+    return 1
+
+### Remove a single file.
+define disk_remove_file with path as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    set ok to remove_file(disk_location(path))
+    return 1
+
+### Remove a folder.
+define disk_remove_folder with path as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    set ok to remove_directory(disk_location(path))
+    return 1
+
+### Give a file or folder a new place or name.
+define disk_rename with old_path as Str and new_path as Str:
+    if disk_path_is_safe(old_path) == 0:
+        return 0
+    if disk_path_is_safe(new_path) == 0:
+        return 0
+    set ok to rename_file(disk_location(old_path) and disk_location(new_path))
+    return 1
+
+### Prepare the disk itself on the very first boot. Internal to boot.
+define disk_prepare:
+    if file_exists("disk") == 0:
+        set ok to create_directory("disk")
+    return 1

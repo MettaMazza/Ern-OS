@@ -1,0 +1,29 @@
+# help_text — what to say when someone asks for help.
+#
+# Userland. Every sentence Ern-OS understands, shown as examples.
+
+define show_help:
+    set ok to say("Here is what you can say to me:")
+    set ok to say("")
+    set ok to say("  Finding your way")
+    set ok to say("    where am i             - which folder you are standing in")
+    set ok to say("    show my files          - what is in this folder")
+    set ok to say("    look in letters        - what is in another folder")
+    set ok to say("    go to letters          - step into a folder")
+    set ok to say("    go up                  - step out to the folder above")
+    set ok to say("    go home                - back to your home folder")
+    set ok to say("")
+    set ok to say("  Making and changing things")
+    set ok to say("    make a folder called letters")
+    set ok to say("    write a note called hello saying good morning")
+    set ok to say("    read hello             - show what a note says")
+    set ok to say("    move hello to greeting - rename or move something")
+    set ok to say("    remove hello           - throw something away")
+    set ok to say("")
+    set ok to say("  About you and the system")
+    set ok to say("    who am i               - your name and role")
+    set ok to say("    what time is it")
+    set ok to say("    help                   - this list")
+    set ok to say("    log out                - let someone else use the machine")
+    set ok to say("    shut down              - stop Ern-OS")
+    return 0

@@ -1,0 +1,179 @@
+# virtual_files — the world of folders and notes that Ern-OS shows people.
+#
+# Kernel layer. Paths here are virtual: "home/maria/letters" — the person
+# sees them with a leading slash, like /home/maria/letters. This file
+# decides what exists, who may change what, and keeps everyone inside
+# the disk. It talks only to the hal (the_disk).
+#
+# Actions that change things give back a small answer code:
+#   1 = it worked        2 = not allowed for this person
+#   3 = that name will not do    4 = there is no such thing
+#   5 = the folder is not empty  6 = there is already one
+
+### Turn what a person typed into a full virtual path.
+### "letters" while standing in home/maria becomes home/maria/letters;
+### "/home/maria" with a leading slash is already a full path.
+define vf_resolve with session and raw as Str:
+    set r to string_trim(concat(raw and ""))
+    set len to string_length(r)
+    if len == 0:
+        return session_place(session)
+    if starts_with(r and "/") == 1:
+        set trimmed to substring(r and 1 and len - 1)
+        return concat(trimmed and "")
+    set here to session_place(session)
+    set joined to concat(here and "/")
+    return concat(joined and r)
+
+### The folder above a path. The folder above a top folder is "".
+define vf_parent with path as Str:
+    set p to concat(path and "")
+    set cut to string_last_index_of(p and "/")
+    if cut < 0:
+        return ""
+    return substring(p and 0 and cut)
+
+### Show a full path the way people read it, with a leading slash.
+define vf_shown with path as Str:
+    return concat("/" and path)
+
+### Does something live at this spot?
+define vf_exists with session and raw as Str:
+    set path to vf_resolve(session and raw)
+    return disk_exists(path)
+
+### Is the thing at this spot a folder?
+define vf_is_folder with session and raw as Str:
+    set path to vf_resolve(session and raw)
+    return disk_is_folder(path)
+
+### What is inside a folder? Gives back a list of lines ready to show,
+### folders marked as such.
+define vf_look with session and raw as Str:
+    set entries to create_list()
+    set path to vf_resolve(session and raw)
+    if disk_is_folder(path) == 0:
+        return entries
+    set names to disk_list(path)
+    for each entry in names:
+        set name to concat(entry and "")
+        set spot to concat(path and "/")
+        set spot to concat(spot and name)
+        if disk_is_folder(spot) == 1:
+            set shown to concat(name and "  (a folder)")
+            set ok to append_list(entries and shown)
+        else:
+            set ok to append_list(entries and name)
+    return entries
+
+### Read a note. Gives back "" when there is no such note.
+define vf_read with session and raw as Str:
+    set path to vf_resolve(session and raw)
+    if disk_exists(path) == 0:
+        return ""
+    if disk_is_folder(path) == 1:
+        return ""
+    return disk_read(path)
+
+### Write a note, replacing what was there.
+define vf_write with session and raw as Str and text as Str:
+    set path to vf_resolve(session and raw)
+    if disk_path_is_safe(path) == 0:
+        return 3
+    if session_may_write(session and path) == 0:
+        return 2
+    set parent to vf_parent(path)
+    if string_length(parent) > 0:
+        if disk_is_folder(parent) == 0:
+            return 4
+    if disk_is_folder(path) == 1:
+        return 6
+    set ok to disk_write(path and text)
+    return 1
+
+### Make a new folder.
+define vf_make_folder with session and raw as Str:
+    set path to vf_resolve(session and raw)
+    if disk_path_is_safe(path) == 0:
+        return 3
+    if session_may_write(session and path) == 0:
+        return 2
+    if disk_exists(path) == 1:
+        return 6
+    set parent to vf_parent(path)
+    if string_length(parent) > 0:
+        if disk_is_folder(parent) == 0:
+            return 4
+    set ok to disk_make_folder(path)
+    return 1
+
+### Remove a note or an empty folder.
+define vf_remove with session and raw as Str:
+    set path to vf_resolve(session and raw)
+    if disk_path_is_safe(path) == 0:
+        return 3
+    if session_may_write(session and path) == 0:
+        return 2
+    if disk_exists(path) == 0:
+        return 4
+    if disk_is_folder(path) == 1:
+        set inside to disk_list(path)
+        if length_list(inside) > 0:
+            return 5
+        set ok to disk_remove_folder(path)
+        return 1
+    set ok to disk_remove_file(path)
+    return 1
+
+### Move or rename something.
+define vf_move with session and raw_from as Str and raw_to as Str:
+    set from_path to vf_resolve(session and raw_from)
+    set to_path to vf_resolve(session and raw_to)
+    if disk_path_is_safe(from_path) == 0:
+        return 3
+    if disk_path_is_safe(to_path) == 0:
+        return 3
+    if disk_exists(from_path) == 0:
+        return 4
+    if session_may_write(session and from_path) == 0:
+        return 2
+    if session_may_write(session and to_path) == 0:
+        return 2
+    if disk_exists(to_path) == 1:
+        return 6
+    set ok to disk_rename(from_path and to_path)
+    return 1
+
+### Step into a folder. Gives back 1 when the session has moved.
+define vf_go with session and raw as Str:
+    set path to vf_resolve(session and raw)
+    if disk_is_folder(path) == 0:
+        return 4
+    set ok to session_move_to(session and path)
+    return 1
+
+### Step up to the folder above. At the top, stay put.
+define vf_go_up with session:
+    set here to session_place(session)
+    set parent to vf_parent(here)
+    if string_length(parent) == 0:
+        return 4
+    set ok to session_move_to(session and parent)
+    return 1
+
+# ---- First boot ----
+
+### Has this disk been prepared before?
+define vf_disk_is_formatted:
+    return disk_exists("system/registry/users")
+
+### Prepare a brand new disk: the folders every Ern-OS needs.
+define vf_format_disk:
+    set ok to disk_prepare()
+    set ok to disk_make_folder("home")
+    set ok to disk_make_folder("system")
+    set ok to disk_make_folder("system/registry")
+    set ok to disk_make_folder("system/registry/users")
+    set ok to disk_make_folder("system/log")
+    set ok to disk_make_folder("apps")
+    return 1

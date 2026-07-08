@@ -1,0 +1,84 @@
+# start_ern_os — the whole operating system starts here.
+#
+# This file is the import manifest for all of Ern-OS: it names every
+# module exactly once, in dependency order — standard library first,
+# then the hardware abstraction layer, then the kernel, then userland.
+# (Modules themselves carry no imports; the Ernos compiler builds the
+# whole program from this one file.)
+#
+# Build:  bash build_ern_os.sh        Boot:  ./start_ern_os
+
+import "string"
+import "fs"
+import "datetime"
+import "crypto"
+
+import "system/hal/the_terminal.ep"
+import "system/hal/the_disk.ep"
+import "system/hal/the_clock.ep"
+import "system/hal/the_machine.ep"
+
+import "system/kernel/system_log.ep"
+import "system/kernel/user_accounts.ep"
+import "system/kernel/sessions.ep"
+import "system/kernel/virtual_files.ep"
+
+import "system/shell/understand_command.ep"
+import "system/shell/help_text.ep"
+import "system/shell/do_command.ep"
+import "system/shell/the_shell.ep"
+
+### The very first boot: prepare the disk and meet the first person.
+### They become the administrator.
+define first_boot:
+    set ok to say("This looks like the very first start, so let me prepare the disk...")
+    set ok to vf_format_disk()
+    set ok to say("The disk is ready.")
+    set ok to say("")
+    set ok to say("Ern-OS needs to know one person before we begin - you.")
+    set ok to say("You will be the administrator of this machine.")
+    repeat while 1 == 1:
+        set name to ask("What should I call you? (letters and digits only) ")
+        if account_name_is_ok(name) == 0:
+            set ok to say("That name will not do - letters, digits, dashes and underscores only.")
+            continue
+        set password to ask("Choose a password (at least 4 characters): ")
+        if string_length(password) < 4:
+            set ok to say("That password is too short.")
+            continue
+        set made to create_account(name and password and "admin")
+        if made == 1:
+            set ok to say(f"Pleased to meet you, {name}. Your home is /home/{name}.")
+            set ok to log_note(f"first boot: administrator {name} created")
+            return 0
+        set ok to say("Something went wrong making your account. Let us try again.")
+    return 0
+
+define main:
+    set ok to say("")
+    set ok to say("=====================================")
+    set ok to say("  Ern-OS")
+    set ok to say("  a small operating system written")
+    set ok to say("  entirely in plain-English Ernos")
+    set ok to say("=====================================")
+    set ok to say(f"  {clock_stamp()} - on {machine_system_name()} ({machine_chip_name()})")
+    set ok to say("")
+
+    if vf_disk_is_formatted() == 0:
+        set ok to first_boot()
+    set ok to log_note("system booted")
+
+    repeat while 1 == 1:
+        set ok to say("")
+        set session to login_flow()
+        if length_list(session) == 0:
+            continue
+        set wants_shutdown to shell_loop(session)
+        if wants_shutdown == 1:
+            break
+
+    set ok to say("")
+    set ok to say("Ern-OS is going to sleep. Goodbye.")
+    set ok to log_note("system shut down")
+    set ok to machine_power_off(0)
+    return 0

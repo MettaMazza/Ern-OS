@@ -1,0 +1,30 @@
+# system_log — the diary Ern-OS keeps about itself.
+#
+# Kernel layer. Every meaningful action in the system gets one line here,
+# with a timestamp, so a person can always read back what happened.
+# The log lives inside the virtual disk at system/log/system.log.
+
+### Where the system diary lives on the disk.
+define system_log_path:
+    return "system/log/system.log"
+
+### Write one line into the system diary. kind is "note", "warning"
+### or "problem".
+define log_line with kind as Str and text as Str:
+    set stamp to clock_stamp()
+    set line to f"[{stamp}] {kind}: {text}"
+    set line_with_ending to concat(line and "\n")
+    set ok to disk_append(system_log_path() and line_with_ending)
+    return 0
+
+### Record something ordinary that happened.
+define log_note with text as Str:
+    return log_line("note" and text)
+
+### Record something worrying.
+define log_warning with text as Str:
+    return log_line("warning" and text)
+
+### Record something that went wrong.
+define log_problem with text as Str:
+    return log_line("problem" and text)

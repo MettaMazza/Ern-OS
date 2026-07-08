@@ -1,0 +1,30 @@
+# the_terminal — how Ern-OS talks to the person at the keyboard.
+#
+# This is part of the hardware abstraction layer. It is the ONLY place in
+# Ern-OS that is allowed to write to the screen or read from the keyboard.
+# On bare metal, this file would be rewritten to drive a serial port or a
+# display directly — and nothing above it would change.
+
+### Show a line of text on the screen.
+define say with text as Str:
+    display concat(text and "")
+    return 0
+
+### Show a blank line.
+define say_nothing:
+    display ""
+    return 0
+
+### Ask a question and wait for the person to type an answer.
+define ask with prompt as Str:
+    display_string(prompt)
+    set answer to read_line()
+    return string_trim(concat(answer and ""))
+
+### Push old text off the top of the screen.
+define clear_screen:
+    set i to 0
+    repeat while i < 40:
+        display ""
+        set i to i + 1
+    return 0

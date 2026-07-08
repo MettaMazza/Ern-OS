@@ -1,0 +1,58 @@
+# sessions — who is at the keyboard right now.
+#
+# Kernel layer. A session is created after a successful login and follows
+# the person around: who they are, what they may do, and which folder
+# they are standing in.
+#
+# A session is kept as a small list — spot 0 is the person's name,
+# spot 1 their role, spot 2 the folder they stand in, spot 3 when the
+# session began. (A list, not a structure, because the garbage collector
+# currently loses text stored in structure fields — see the language
+# repo's known bugs. The accessors below keep call sites readable.)
+
+### Begin a session for a person who just logged in.
+define begin_session with name as Str and role as Str:
+    set session to create_list()
+    set ok to append_list(session and concat(name and ""))
+    set ok to append_list(session and concat(role and ""))
+    set home to f"home/{name}"
+    set ok to append_list(session and home)
+    set stamp to clock_stamp()
+    set ok to append_list(session and stamp)
+    return session
+
+### Whose session is this?
+define session_person with session:
+    return concat(get_list(session and 0) and "")
+
+### What may this person do? "admin" or "member".
+define session_role with session:
+    return concat(get_list(session and 1) and "")
+
+### Which folder is this person standing in?
+define session_place with session:
+    return concat(get_list(session and 2) and "")
+
+### When did this session begin?
+define session_started with session:
+    return concat(get_list(session and 3) and "")
+
+### Step into a different folder.
+define session_move_to with session and place as Str:
+    set kept to concat(place and "")
+    set ok to set_list(session and 2 and kept)
+    return 0
+
+### Is this person allowed to change things at this path?
+### Admins may write anywhere; everyone else only inside their own home.
+define session_may_write with session and path as Str:
+    set role to session_role(session)
+    if string_equals(role and "admin") == 1:
+        return 1
+    set person to session_person(session)
+    set own_home to f"home/{person}"
+    set p to concat(path and "")
+    if string_equals(p and own_home) == 1:
+        return 1
+    set fence to concat(own_home and "/")
+    return starts_with(p and fence)

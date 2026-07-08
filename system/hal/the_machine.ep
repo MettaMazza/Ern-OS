@@ -1,0 +1,27 @@
+# the_machine — what Ern-OS knows about the computer it lives on.
+#
+# This is part of the hardware abstraction layer. It is the ONLY place in
+# Ern-OS that is allowed to ask about, or act on, the host machine itself.
+# On bare metal, this file would be rewritten to talk to the CPU directly —
+# and nothing above it would change.
+#
+# These three externals are Ern-OS's entire "syscall" surface for the
+# machine itself. (Declared here directly rather than importing the whole
+# "os" stdlib module, which clashes with "fs" over get_cwd.)
+
+external define ep_os_name:
+external define ep_arch_name:
+external define ep_exit with code:
+
+### The name of the system underneath us, like "Darwin" or "Linux".
+define machine_system_name:
+    return concat(ep_os_name() and "")
+
+### The kind of processor, like "arm64" or "x86_64".
+define machine_chip_name:
+    return concat(ep_arch_name() and "")
+
+### Stop the machine. This ends Ern-OS itself.
+define machine_power_off with code:
+    set ok to ep_exit(code)
+    return 0

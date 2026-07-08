@@ -1,0 +1,27 @@
+# the_clock — how Ern-OS knows what time it is.
+#
+# This is part of the hardware abstraction layer. It is the ONLY place in
+# Ern-OS that is allowed to ask the host machine for the time. On bare
+# metal, this file would be rewritten to read a hardware timer — and
+# nothing above it would change.
+
+### The current moment, in milliseconds since the first day of 1970.
+define now_in_milliseconds:
+    return now_ms()
+
+### The current moment, in seconds since the first day of 1970.
+define now_in_seconds:
+    return now_seconds()
+
+### The current date and time, written out like "2026-07-08 14:30:00".
+define clock_stamp:
+    return concat(format_time(now_seconds() and "%Y-%m-%d %H:%M:%S") and "")
+
+### Just the time of day, written out like "14:30".
+define clock_time_of_day:
+    return concat(format_time(now_seconds() and "%H:%M") and "")
+
+### Do nothing for a little while.
+define wait_milliseconds with ms:
+    set ok to sleep_ms(ms)
+    return 0

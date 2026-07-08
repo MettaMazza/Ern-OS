@@ -1,0 +1,140 @@
+# user_accounts — who is allowed to use this computer.
+#
+# Kernel layer. Each person has one record file on the disk, written in
+# plain English lines, at system/registry/users/<name>. Passwords are
+# never stored — only a salted, well-stretched fingerprint of them.
+
+### How many times a password is folded through SHA-256 before storing.
+### More folds make guessing attacks slower.
+define stretch_rounds:
+    return 100000
+
+### Where a person's record file lives on the disk.
+define account_record_path with name as Str:
+    return f"system/registry/users/{name}"
+
+### A person's name may use letters, digits, dashes and underscores —
+### nothing else, so it also works as their home folder name.
+define account_name_is_ok with name as Str:
+    set n to concat(name and "")
+    set len to string_length(n)
+    if len == 0:
+        return 0
+    if len > 32:
+        return 0
+    set i to 0
+    repeat while i < len:
+        set ch to get_character(n and i)
+        set ok to 0
+        if is_alphanumeric(ch) == 1:
+            set ok to 1
+        if ch == 45:
+            set ok to 1
+        if ch == 95:
+            set ok to 1
+        if ok == 0:
+            return 0
+        set i to i + 1
+    return 1
+
+### Is there already a record for this person?
+define account_exists with name as Str:
+    if account_name_is_ok(name) == 0:
+        return 0
+    set record_path to account_record_path(name)
+    return disk_exists(record_path)
+
+### Make a fresh random salt, as 32 hex characters.
+define make_salt:
+    set bytes to random_bytes(16)
+    set salt to ""
+    for each b in bytes:
+        set piece to byte_to_hex(b)
+        set salt to concat(salt and piece)
+    return salt
+
+### Turn a salt and a password into the stored fingerprint:
+### fold SHA-256 over it many times.
+define stretch_secret with salt as Str and password as Str:
+    set mixed to concat(salt and password)
+    set fingerprint to concat(crypto_sha256(mixed) and "")
+    set i to 0
+    repeat while i < stretch_rounds():
+        set fingerprint to concat(crypto_sha256(fingerprint) and "")
+        set i to i + 1
+    return fingerprint
+
+### Read one "key is value" line out of a record.
+define record_field with content as Str and key as Str:
+    set marker to f"{key} is "
+    set marker_len to string_length(marker)
+    set lines to split(content and "\n")
+    for each entry in lines:
+        set line to concat(entry and "")
+        if starts_with(line and marker) == 1:
+            set line_len to string_length(line)
+            set value to substring(line and marker_len and line_len - marker_len)
+            return concat(value and "")
+    return ""
+
+### Create a new person: write their record and make their home folder.
+### role is "admin" or "member". Gives back 1 when it worked.
+define create_account with name as Str and password as Str and role as Str:
+    if account_name_is_ok(name) == 0:
+        return 0
+    if account_exists(name) == 1:
+        return 0
+    if string_length(password) < 4:
+        return 0
+    set salt to make_salt()
+    set secret to stretch_secret(salt and password)
+    set stamp to clock_stamp()
+    set record to f"name is {name}"
+    set record to concat(record and "\n")
+    set record to concat(record and f"salt is {salt}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"secret is {secret}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"rounds is {stretch_rounds()}")
+    set record to concat(record and "\n")
+    set record to concat(record and "scheme is stretched-sha256")
+    set record to concat(record and "\n")
+    set record to concat(record and f"role is {role}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"created is {stamp}")
+    set record to concat(record and "\n")
+    set record_path to account_record_path(name)
+    set ok to disk_write(record_path and record)
+    set home to f"home/{name}"
+    if disk_exists(home) == 0:
+        set ok to disk_make_folder(home)
+    set ok to log_note(f"created account {name} with role {role}")
+    return 1
+
+### Check a name and password. Gives back 1 when they match.
+define verify_login with name as Str and password as Str:
+    if account_exists(name) == 0:
+        return 0
+    set record_path to account_record_path(name)
+    set record to disk_read(record_path)
+    set salt to record_field(record and "salt")
+    set stored to record_field(record and "secret")
+    if string_length(salt) == 0:
+        return 0
+    if string_length(stored) == 0:
+        return 0
+    set attempt to stretch_secret(salt and password)
+    return string_equals(attempt and stored)
+
+### What role does this person have? "admin", "member", or "".
+define account_role with name as Str:
+    if account_exists(name) == 0:
+        return ""
+    set record_path to account_record_path(name)
+    set record to disk_read(record_path)
+    return record_field(record and "role")
+
+### How many people have accounts?
+define account_count:
+    set names to disk_list("system/registry/users")
+    return length_list(names)

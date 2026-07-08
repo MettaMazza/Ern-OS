@@ -1,0 +1,15 @@
+# built things
+toolchain/epc
+start_ern_os
+*_compiled.c
+test_understand_command
+test_user_accounts
+test_virtual_files
+tests/tmp_run/
+
+# the living world of a running Ern-OS (personal data, never committed)
+disk/
+
+# scratch
+*.out
+.DS_Store
