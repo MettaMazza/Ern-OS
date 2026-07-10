@@ -1,4 +1,4 @@
-# test_services — does the service table keep an honest record?
+# test_services — do real background services and the message board hold?
 #
 # Compile from the repo root; RUN inside a scratch folder (the runner
 # does this) so the "disk" it creates is a throwaway one.
@@ -15,6 +15,7 @@ import "../system/kernel/system_log.ep"
 import "../system/kernel/user_accounts.ep"
 import "../system/kernel/sessions.ep"
 import "../system/kernel/virtual_files.ep"
+import "../system/kernel/messages.ep"
 import "../system/kernel/services.ep"
 
 define expect_number with label as Str and got and wanted:
@@ -29,31 +30,59 @@ define main:
     set bad to 0
     set ok to vf_format_disk()
     set services to create_service_table()
+    set board to create_message_board()
 
-    set bad to bad + expect_number("heartbeat starts" and service_start(services and "heartbeat") and 1)
-    set bad to bad + expect_number("starting twice refused" and service_start(services and "heartbeat") and 6)
-    set bad to bad + expect_number("unknown service refused" and service_start(services and "juggler") and 4)
+    # The message board itself.
+    set ch to create_channel()
+    set bad to bad + expect_number("board registers a channel" and board_register(board and "test line" and ch) and 1)
+    if board_channel(board and "test line") == ch:
+        display "PASS: board finds the channel by name"
+    else:
+        display "FAIL: board finds the channel by name"
+        set bad to bad + 1
+    set bad to bad + expect_number("unknown name gives nothing" and board_channel(board and "no such line") and 0)
+
+    # A real background thread, spoken to only through the board.
+    set bad to bad + expect_number("heartbeat starts" and service_start(services and board and "heartbeat") and 1)
+    set bad to bad + expect_number("starting twice refused" and service_start(services and board and "heartbeat") and 6)
+    set bad to bad + expect_number("unknown service refused" and service_start(services and board and "juggler") and 4)
     set bad to bad + expect_number("running says so" and service_is_running(services and "heartbeat") and 1)
 
-    set first_ask to service_ask(services and "heartbeat")
+    set first_ask to service_ask(services and board and "heartbeat")
     if first_ask >= 0:
-        display "PASS: a fresh heartbeat answers"
+        display "PASS: a fresh heartbeat answers over the board"
     else:
-        display "FAIL: a fresh heartbeat answers"
+        display "FAIL: a fresh heartbeat answers over the board"
         set bad to bad + 1
 
-    set ok to wait_milliseconds(1200)
-    set later_ask to service_ask(services and "heartbeat")
+    set ok to wait_milliseconds(2200)
+    set later_ask to service_ask(services and board and "heartbeat")
     if later_ask > first_ask:
-        display "PASS: beats grow with time"
+        display "PASS: beats grow with time (a real thread is counting)"
     else:
         display f"FAIL: beats grow with time (was {first_ask}, then {later_ask})"
         set bad to bad + 1
 
-    set bad to bad + expect_number("stop works" and service_stop(services and "heartbeat") and 1)
-    set bad to bad + expect_number("stopping twice refused" and service_stop(services and "heartbeat") and 6)
-    set bad to bad + expect_number("stopped does not answer" and service_ask(services and "heartbeat") and 0 - 1)
-    set bad to bad + expect_number("restart works" and service_start(services and "heartbeat") and 1)
+    # THE regression: hashing on the main thread while a service thread
+    # is alive. This exact mix used to segfault the whole system (GC bug,
+    # fixed in the language runtime; kept here so it can never sneak back).
+    set made to create_account("maria" and "sunrise" and "admin")
+    set bad to bad + expect_number("account created under live heartbeat" and made and 1)
+    set bad to bad + expect_number("wrong password refused under live heartbeat" and verify_login("maria" and "moonset") and 0)
+    set bad to bad + expect_number("right password welcomed under live heartbeat" and verify_login("maria" and "sunrise") and 1)
+    set still_beating to service_ask(services and board and "heartbeat")
+    if still_beating > later_ask:
+        display "PASS: the heartbeat kept beating through it all"
+    else:
+        display f"FAIL: the heartbeat kept beating through it all (was {later_ask}, then {still_beating})"
+        set bad to bad + 1
+
+    set bad to bad + expect_number("stop works" and service_stop(services and board and "heartbeat") and 1)
+    set bad to bad + expect_number("stopping twice refused" and service_stop(services and board and "heartbeat") and 6)
+    set bad to bad + expect_number("stopped does not answer" and service_ask(services and board and "heartbeat") and 0 - 1)
+    set bad to bad + expect_number("restart works" and service_start(services and board and "heartbeat") and 1)
+    set bad to bad + expect_number("restarted answers again" and service_ask(services and board and "heartbeat") >= 0 and 1)
+    set bad to bad + expect_number("final stop" and service_stop(services and board and "heartbeat") and 1)
 
     set ok to record_boot_moment()
     set up to uptime_seconds()

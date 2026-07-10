@@ -1,46 +1,61 @@
 # sessions — who is at the keyboard right now.
 #
-# Kernel layer. A session is created after a successful login and follows
+# Kernel layer. A Session is created after a successful login and follows
 # the person around: who they are, what they may do, and which folder
-# they are standing in.
-#
-# A session is kept as a small list — spot 0 is the person's name,
-# spot 1 their role, spot 2 the folder they stand in, spot 3 when the
-# session began. (A list, not a structure, because the garbage collector
-# currently loses text stored in structure fields — see the language
-# repo's known bugs. The accessors below keep call sites readable.)
+# they are standing in. It is a structure; the small accessor functions
+# below keep every call site reading like a sentence.
+
+define structure Session:
+    field person as Str
+    field role as Str
+    field place as Str
+    field started as Str
 
 ### Begin a session for a person who just logged in.
-define begin_session with name as Str and role as Str:
-    set session to create_list()
-    set ok to append_list(session and concat(name and ""))
-    set ok to append_list(session and concat(role and ""))
-    set home to f"home/{name}"
-    set ok to append_list(session and home)
+define begin_session with name as Str and role_name as Str:
+    set kept_name to concat(name and "")
+    set kept_role to concat(role_name and "")
+    set home to f"home/{kept_name}"
     set stamp to clock_stamp()
-    set ok to append_list(session and stamp)
+    set session to create Session:
+        person is kept_name
+        role is kept_role
+        place is home
+        started is stamp
     return session
+
+### A session that belongs to nobody — what a failed login gives back.
+define nobody_session:
+    return begin_session("" and "")
+
+### Does this session belong to a real person? (A failed login gives
+### back a session with no name.)
+define session_is_real with session:
+    set name to session_person(session)
+    if string_length(name) == 0:
+        return 0
+    return 1
 
 ### Whose session is this?
 define session_person with session:
-    return concat(get_list(session and 0) and "")
+    return concat(session.person and "")
 
 ### What may this person do? "admin" or "member".
 define session_role with session:
-    return concat(get_list(session and 1) and "")
+    return concat(session.role and "")
 
 ### Which folder is this person standing in?
 define session_place with session:
-    return concat(get_list(session and 2) and "")
+    return concat(session.place and "")
 
 ### When did this session begin?
 define session_started with session:
-    return concat(get_list(session and 3) and "")
+    return concat(session.started and "")
 
 ### Step into a different folder.
 define session_move_to with session and place as Str:
     set kept to concat(place and "")
-    set ok to set_list(session and 2 and kept)
+    set session.place to kept
     return 0
 
 ### Is this person allowed to change things at this path?

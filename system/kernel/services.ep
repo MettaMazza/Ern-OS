@@ -1,19 +1,37 @@
-# services — the things Ern-OS keeps an eye on in the background.
+# services — the things Ern-OS keeps doing in the background.
 #
-# Kernel layer. A service record is a small list — spot 0 the name,
-# spot 1 whether it is running, spot 2 the moment it started.
+# Kernel layer. A service runs on its own thread and owns everything it
+# touches. The rest of the system talks to it only through the message
+# board (messages.ep): orders go in on "<name> orders", answers come
+# back on "<name> answers". Messages are small numbers:
 #
-# HONESTY NOTE: these services are kept without real threads for now.
-# The Ernos runtime's garbage collector is not yet safe with threads —
-# a crypto_sha256 loop (as in every password check) crashes if any
-# spawned thread merely exists (bug filed in the language repo, with a
-# deterministic repro; the two-channel threaded design is in this
-# repo's git history, proven by probes, and can return the day the GC
-# is thread-safe). Until then the heartbeat "beats" are the seconds
-# since the service started — same meaning, no thread.
+#   orders:   1 = please stop        2 = how are you doing?
+#   answers:  the requested number, or 99 to say "stopped, goodbye"
 #
-# Answer codes match the rest of the kernel:
-#   1 = done   4 = no such service   6 = already so
+# A service record is a small list — spot 0 the name, spot 1 whether it
+# is running. The channels themselves live on the message board.
+
+### The heartbeat: counts one beat a second, so anyone can ask whether
+### the system is alive and for how long it has been.
+define heartbeat_service with control and answers:
+    # Everything this thread will ever need is made here, once — a
+    # steady service loop touches only what it already owns.
+    set orders to create_list()
+    set ok to append_list(orders and control)
+    set beats to 0
+    set stop to 0
+    repeat while stop == 0:
+        set ready to channel_select(orders and 1000)
+        if ready == 0:
+            set order to receive from control
+            if order == 1:
+                set stop to 1
+            if order == 2:
+                send beats to answers
+        else:
+            set beats to beats + 1
+    send 99 to answers
+    return 0
 
 ### An empty table of services. Made once at boot.
 define create_service_table:
@@ -29,7 +47,7 @@ define find_service with services and name as Str:
         if string_equals(record_name and name) == 1:
             return i
         set i to i + 1
-    return -1
+    return 0 - 1
 
 ### Is this service running? 1 or 0; -1 when there is no such service.
 define service_is_running with services and name as Str:
@@ -39,55 +57,61 @@ define service_is_running with services and name as Str:
     set record to get_list(services and spot)
     return get_list(record and 1)
 
-### Start a service by name. 1 = started, 6 = already running,
-### 4 = no such service is known.
-define service_start with services and name as Str:
-    if string_equals(name and "heartbeat") == 0:
-        return 4
+### Start a service by name: spawn its thread and post its channels on
+### the message board. 1 = started, 6 = already running, 4 = unknown.
+define service_start with services and board and name as Str:
     set spot to find_service(services and name)
     if spot >= 0:
         set record to get_list(services and spot)
         if get_list(record and 1) == 1:
             return 6
+    if string_equals(name and "heartbeat") == 0:
+        return 4
+    set control to create_channel()
+    set answers to create_channel()
+    spawn heartbeat_service(control and answers)
+    set orders_name to f"{name} orders"
+    set answers_name to f"{name} answers"
+    set ok to board_register(board and orders_name and control)
+    set ok to board_register(board and answers_name and answers)
+    if spot >= 0:
+        set record to get_list(services and spot)
         set ok to set_list(record and 1 and 1)
-        set ok to set_list(record and 2 and now_in_seconds())
-        set ok to log_note(f"service {name} started")
-        return 1
-    set record to create_list()
-    set ok to append_list(record and concat(name and ""))
-    set ok to append_list(record and 1)
-    set ok to append_list(record and now_in_seconds())
-    set ok to append_list(services and record)
+    else:
+        set record to create_list()
+        set ok to append_list(record and concat(name and ""))
+        set ok to append_list(record and 1)
+        set ok to append_list(services and record)
     set ok to log_note(f"service {name} started")
     return 1
 
-### Ask a running service how it is doing (its beat count — one beat
-### a second since it started). -1 when it cannot answer.
-define service_ask with services and name as Str:
-    set spot to find_service(services and name)
-    if spot < 0:
+### Ask a running service how it is doing (its beat count), through the
+### message board. Gives back the number, or -1 when it cannot answer.
+define service_ask with services and board and name as Str:
+    if service_is_running(services and name) != 1:
         return 0 - 1
-    set record to get_list(services and spot)
-    if get_list(record and 1) == 0:
-        return 0 - 1
-    set started to get_list(record and 2)
-    return now_in_seconds() - started
+    set orders_name to f"{name} orders"
+    set answers_name to f"{name} answers"
+    return board_ask(board and orders_name and answers_name and 2)
 
-### Stop a service. 1 = stopped, 4 = no such service, 6 = it was
-### not running.
-define service_stop with services and name as Str:
+### Stop a service politely and wait for its goodbye.
+### 1 = stopped, 4 = no such service, 6 = it was not running.
+define service_stop with services and board and name as Str:
     set spot to find_service(services and name)
     if spot < 0:
         return 4
     set record to get_list(services and spot)
     if get_list(record and 1) == 0:
         return 6
+    set orders_name to f"{name} orders"
+    set answers_name to f"{name} answers"
+    set goodbye to board_ask(board and orders_name and answers_name and 1)
     set ok to set_list(record and 1 and 0)
     set ok to log_note(f"service {name} stopped")
     return 1
 
 ### Lines describing every service, ready to show a person.
-define service_lines with services:
+define service_lines with services and board:
     set lines to create_list()
     set n to length_list(services)
     set i to 0
@@ -95,9 +119,13 @@ define service_lines with services:
         set record to get_list(services and i)
         set name to concat(get_list(record and 0) and "")
         if get_list(record and 1) == 1:
-            set beats to service_ask(services and name)
-            set line to f"{name}  - running, {beats} beats so far"
-            set ok to append_list(lines and line)
+            set beats to service_ask(services and board and name)
+            if beats >= 0:
+                set line to f"{name}  - running, {beats} beats so far"
+                set ok to append_list(lines and line)
+            else:
+                set line to f"{name}  - running, but not answering"
+                set ok to append_list(lines and line)
         else:
             set line to f"{name}  - stopped"
             set ok to append_list(lines and line)

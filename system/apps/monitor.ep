@@ -16,7 +16,7 @@ define pretty_duration with total:
     return f"{hours} hours and {minutes_left} minutes"
 
 ### The monitor app itself.
-define run_monitor with session and services:
+define run_monitor with session and services and board:
     set ok to say("")
     set ok to say("-- System monitor --")
     set ok to say(f"The machine     {machine_system_name()} ({machine_chip_name()})")
@@ -34,7 +34,7 @@ define run_monitor with session and services:
     set folders to get_list(tally and 1)
     set ok to say(f"On the disk     {notes} notes in {folders} folders")
     set ok to say("Services")
-    set lines to service_lines(services)
+    set lines to service_lines(services and board)
     if length_list(lines) == 0:
         set ok to say("  (none)")
     for each entry in lines:

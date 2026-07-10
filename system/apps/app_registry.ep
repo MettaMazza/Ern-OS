@@ -26,7 +26,7 @@ define app_lines:
     return lines
 
 ### Open an app by name and stay with it until it finishes.
-define launch_app with session and services and name as Str:
+define launch_app with session and services and board and name as Str:
     set person to session_person(session)
     set ok to log_note(f"{person} opened {name}")
     if string_equals(name and "notes") == 1:
@@ -34,7 +34,7 @@ define launch_app with session and services and name as Str:
     if string_equals(name and "files") == 1:
         return run_files(session)
     if string_equals(name and "monitor") == 1:
-        return run_monitor(session and services)
+        return run_monitor(session and services and board)
     if string_equals(name and "welcome") == 1:
         return run_welcome(session)
     return 0

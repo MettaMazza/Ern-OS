@@ -22,6 +22,7 @@ import "system/kernel/system_log.ep"
 import "system/kernel/user_accounts.ep"
 import "system/kernel/sessions.ep"
 import "system/kernel/virtual_files.ep"
+import "system/kernel/messages.ep"
 import "system/kernel/services.ep"
 
 import "system/apps/notes.ep"
@@ -79,21 +80,22 @@ define main:
     set ok to log_note("system booted")
 
     set services to create_service_table()
-    set ok to service_start(services and "heartbeat")
+    set board to create_message_board()
+    set ok to service_start(services and board and "heartbeat")
 
     repeat while 1 == 1:
         set ok to say("")
         set session to login_flow()
-        if length_list(session) == 0:
+        if session_is_real(session) == 0:
             continue
         if fresh_start == 1:
-            set ok to launch_app(session and services and "welcome")
+            set ok to launch_app(session and services and board and "welcome")
             set fresh_start to 0
-        set wants_shutdown to shell_loop(session and services)
+        set wants_shutdown to shell_loop(session and services and board)
         if wants_shutdown == 1:
             break
 
-    set ok to service_stop(services and "heartbeat")
+    set ok to service_stop(services and board and "heartbeat")
     set ok to say("")
     set ok to say("Ern-OS is going to sleep. Goodbye.")
     set ok to log_note("system shut down")

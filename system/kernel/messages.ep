@@ -1,0 +1,75 @@
+# messages — how parts of Ern-OS talk to each other.
+#
+# Kernel layer. A message board is a registry of named channels: a
+# service posts its channels under well-known names ("heartbeat orders",
+# "heartbeat answers"), and anything else — the shell, an app — can look
+# a channel up by name and speak to it, without ever holding a direct
+# reference to the service. This is the system's IPC layer: services own
+# their threads, and everything crosses between threads through these
+# channels only.
+
+### An empty message board. Made once at boot.
+define create_message_board:
+    return create_list()
+
+### Find the spot of a name on the board, or -1.
+define board_find with board and name as Str:
+    set n to length_list(board)
+    set i to 0
+    repeat while i < n:
+        set entry to get_list(board and i)
+        set entry_name to concat(get_list(entry and 0) and "")
+        if string_equals(entry_name and name) == 1:
+            return i
+        set i to i + 1
+    return 0 - 1
+
+### Put a channel on the board under a name. A name already on the
+### board is given the new channel (a restarted service replaces its own).
+define board_register with board and name as Str and the_channel:
+    set spot to board_find(board and name)
+    if spot >= 0:
+        set entry to get_list(board and spot)
+        set ok to set_list(entry and 1 and the_channel)
+        return 1
+    set entry to create_list()
+    set ok to append_list(entry and concat(name and ""))
+    set ok to append_list(entry and the_channel)
+    set ok to append_list(board and entry)
+    return 1
+
+### The channel registered under a name, or 0 when there is none.
+define board_channel with board and name as Str:
+    set spot to board_find(board and name)
+    if spot < 0:
+        return 0
+    set entry to get_list(board and spot)
+    return get_list(entry and 1)
+
+### Every name on the board.
+define board_names with board:
+    set names to create_list()
+    set n to length_list(board)
+    set i to 0
+    repeat while i < n:
+        set entry to get_list(board and i)
+        set name to concat(get_list(entry and 0) and "")
+        set ok to append_list(names and name)
+        set i to i + 1
+    return names
+
+### Send a number to a named channel and wait (up to a timeout) for a
+### reply on another named channel. The everyday shape of asking a
+### service something. Gives back the reply, or -1 when nothing came.
+define board_ask with board and ask_name as Str and reply_name as Str and message:
+    set ask_channel to board_channel(board and ask_name)
+    set reply_channel to board_channel(board and reply_name)
+    if ask_channel == 0 || reply_channel == 0:
+        return 0 - 1
+    send message to ask_channel
+    set waiting to create_list()
+    set ok to append_list(waiting and reply_channel)
+    set ready to channel_select(waiting and 2000)
+    if ready == 0:
+        return receive from reply_channel
+    return 0 - 1

@@ -41,16 +41,18 @@ can ever reach outside the disk folder, no matter how confused it gets.
 | `user_accounts.ep` | people and their password fingerprints |
 | `sessions.ep` | who is at the keyboard, where they are standing |
 | `system_log.ep` | the diary at `/system/log/system.log` |
-| `services.ep` | the service table (heartbeat, uptime, the boot moment) |
+| `messages.ep` | the message board — named channels, the system's IPC |
+| `services.ep` | real background threads (heartbeat), uptime, the boot moment |
 
-**Why services carry no threads yet.** The runtime's garbage collector
-is not thread-safe today: a password check (a SHA-256 loop) crashes if
-any spawned thread merely exists — a deterministic repro is filed in
-the language repo. The two-channel threaded service design (orders in,
-answers out, integer messages) was built and proven by probes, lives in
-this repo's git history, and returns the day the GC is fixed. Until
-then a service is an honest table entry, and heartbeat beats are the
-seconds since it started.
+**How services work.** A service runs on its own thread and owns
+everything it touches. Its two channels are posted on the message board
+under well-known names ("heartbeat orders", "heartbeat answers"); the
+shell and the apps speak to it only through the board, with small
+number messages (1 = stop, 2 = how are you?). This required fixing the
+language runtime itself — spawned threads were invisible to the garbage
+collector, and a thread waiting in channel_select could stall or crash
+collections — both fixed upstream (with regression tests in the
+language repo's differential suite) after this project found them.
 
 Answer codes: kernel actions that change things return a small number —
 1 it worked, 2 not allowed, 3 bad name, 4 no such thing, 5 folder not
@@ -98,13 +100,16 @@ one folder.
 
 Learned the hard way, enforced by example:
 
-1. Annotate string parameters `as Str` — untyped parameters are inferred
-   as numbers and printed/kept wrong.
-2. Never `display` a parameter or list element directly; go through
-   `say`, or normalize with `concat(x and "")` first.
+1. Annotate string parameters `as Str` — no longer load-bearing since
+   the compiler learned to honor and infer parameter types, but it keeps
+   intent readable.
+2. All words for people go through `say`/`ask` — one owner of the
+   terminal. (The old pointer-printing compiler bug behind this rule is
+   fixed upstream; the style stays because it is right.)
 3. `get_character` returns a number code (space is 32, dot 46). Compare
    codes with `==`, whole strings with `string_equals`.
-4. Keep long-lived text in lists, not structure fields — the garbage
-   collector currently loses strings stored in struct fields (bug filed
-   in the language repo; sessions and commands are lists for this reason).
+4. `channel` is a reserved word — name channel-holding variables things
+   like `control`, `answers`, `the_channel`.
 5. Only `start_ern_os.ep` (and each test file) may import.
+6. A service thread makes everything it needs before its loop and
+   allocates nothing inside it — steady loops own their world.

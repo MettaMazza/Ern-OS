@@ -804,13 +804,27 @@ static long long ep_sleep_timer_step(void* r) {
 }
 
 static long long sleep_ms(long long ms) {
+    /* Outside the event loop (no task is being stepped) a registered timer
+       would never fire on its own, so the cooperative path used to sleep for
+       0 ms. Block for real instead, and hand back an already-completed
+       future so `await sleep_ms(...)` from synchronous code still works. */
+    if (!ep_current_task) {
+        if (ms > 0) ep_sleep_ms(ms);
+        EpFuture* done = (EpFuture*)malloc(sizeof(EpFuture));
+        done->completed = 1;
+        done->value = 0;
+        done->waiting_task = NULL;
+        done->chan = 0;
+        { EpGCObject* _go = ep_gc_register(done, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
+        return (long long)done;
+    }
     EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));
     fut->completed = 0;
     fut->value = 0;
     fut->waiting_task = NULL;
     fut->chan = 0;
     { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }
-    
+
     EpSleepTimerArgs* args = (EpSleepTimerArgs*)malloc(sizeof(EpSleepTimerArgs));
     args->fut = fut;
     
@@ -1931,20 +1945,59 @@ long long channel_has_data(long long chan_ptr) {
     return has;
 }
 
+/* Leave a GC-safe blocking region (see channel_select). If a collection is
+   in progress, wait for it to finish before running mutator code again. */
+static void ep_gc_leave_blocking_region(void) {
+    if (ep_thread_slot < 0) return;
+    pthread_mutex_lock(&ep_gc_mutex);
+    while (ep_gc_stop_requested) {
+        pthread_cond_wait(&ep_gc_resume_cond, &ep_gc_mutex);
+    }
+    ep_gc_parked_count--;
+    pthread_mutex_unlock(&ep_gc_mutex);
+}
+
 // Select: wait for any of N channels to have data, with timeout in ms
 // channels_list is a list of channel pointers
 // Returns index (0-based) of first ready channel, or -1 on timeout
 long long channel_select(long long channels_list, long long timeout_ms) {
     EpList* list = (EpList*)channels_list;
     if (!list || list->length == 0) return -1;
-    
+
 #ifdef _WIN32
     ULONGLONG start_tick = GetTickCount64();
 #else
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 #endif
-    
+
+    /* A GC-safe blocking region. A thread sitting in a long select must not
+       stall every stop-the-world (waking it to park costs ~0.5ms per major
+       collection — allocation-heavy code on another thread pays that tens of
+       thousands of times). Instead, pin this frame's roots once — spill the
+       callee-saved registers into this frame and publish the frame as the
+       thread's stack top — and count the thread as already parked. The
+       collector then proceeds immediately and scans [this frame, stack
+       bottom], a range that is frozen for the whole select: the poll loop
+       below only grows the stack DOWNWARD from here (excluded from the scan)
+       and allocates nothing. On every way out, ep_gc_leave_blocking_region
+       waits for any in-flight collection before mutator code resumes.
+       (Without any of this, the collector scans a live, mutating stack
+       against a stale top, misses the channels list held in a callee-saved
+       register, sweeps it, and the next poll dereferences freed memory.) */
+    jmp_buf _pin_regs;
+    volatile char _pin_marker;
+    if (ep_thread_slot >= 0) {
+        memset(&_pin_regs, 0, sizeof(_pin_regs));
+        setjmp(_pin_regs);
+        pthread_mutex_lock(&ep_gc_mutex);
+        { char* _a = (char*)(void*)&_pin_marker; char* _b = (char*)(void*)&_pin_regs;
+          ep_thread_local_top = (void*)((uintptr_t)((_a < _b) ? _a : _b) & ~(uintptr_t)7); }
+        __sync_synchronize();
+        ep_gc_parked_count++;
+        pthread_mutex_unlock(&ep_gc_mutex);
+    }
+
     while (1) {
         // Poll all channels
         for (long long i = 0; i < list->length; i++) {
@@ -1953,12 +2006,13 @@ long long channel_select(long long channels_list, long long timeout_ms) {
                 ep_mutex_lock(&chan->mutex);
                 if (chan->size > 0) {
                     ep_mutex_unlock(&chan->mutex);
+                    ep_gc_leave_blocking_region();
                     return i;
                 }
                 ep_mutex_unlock(&chan->mutex);
             }
         }
-        
+
         // Check timeout
         if (timeout_ms >= 0) {
 #ifdef _WIN32
@@ -1968,7 +2022,10 @@ long long channel_select(long long channels_list, long long timeout_ms) {
             clock_gettime(CLOCK_MONOTONIC, &now);
             long long elapsed = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
 #endif
-            if (elapsed >= timeout_ms) return -1;
+            if (elapsed >= timeout_ms) {
+                ep_gc_leave_blocking_region();
+                return -1;
+            }
         }
         
         // Brief sleep to avoid busy-wait
@@ -5040,6 +5097,16 @@ long long count_awaits_stmts(long long);
 long long emit_async_yields_expr(long long, long long, long long, long long);
 long long emit_async_yields_stmt(long long, long long, long long, long long);
 long long type_name_to_code(long long);
+long long param_ann_to_code(long long);
+long long seed_param_types(long long, long long, long long);
+long long collect_prim_param_flags(long long, long long);
+long long get_prim_param_flags(long long, long long);
+long long cg_expr_has_var(long long, long long);
+long long cg_is_prim_expr(long long, long long, long long);
+long long cg_stmts_have_nonprim(long long, long long, long long);
+long long usage_promote_call(long long, long long, long long, long long);
+long long infer_usage_types_expr(long long, long long, long long);
+long long infer_usage_types_stmts(long long, long long, long long);
 long long is_builtin_c_func(long long, long long);
 long long get_codegen_borrowed_keys(long long);
 long long set_codegen_borrowed_keys(long long, long long);
@@ -5112,6 +5179,7 @@ long long ep_rt_core_28();
 long long ep_rt_core_29();
 long long ep_rt_core_30();
 long long ep_rt_core_31();
+long long ep_rt_core_32();
 long long ep_rt_builtins_0();
 long long ep_rt_builtins_1();
 long long get_shared_runtime_source();
@@ -5133,7 +5201,12 @@ long long get_file_stem(long long path) {
     long long stem = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&start);
+    ep_gc_push_root(&idx2);
+    ep_gc_push_root(&stem_len);
     ep_gc_push_root(&stem);
+    ep_gc_push_root(&path);
     ep_gc_maybe_collect();
 
     len = string_length((char*)path);
@@ -5161,7 +5234,7 @@ long long get_file_stem(long long path) {
     ret_val = stem;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -5172,6 +5245,9 @@ long long get_file_dir(long long path) {
     long long ch = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&last_slash);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&path);
     ep_gc_maybe_collect();
 
     len = string_length((char*)path);
@@ -5191,6 +5267,7 @@ long long get_file_dir(long long path) {
     ret_val = (long long)substring((char*)path, 0LL, (last_slash + 1LL));
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -5200,6 +5277,9 @@ long long contains_string(long long list, long long s) {
     long long item = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&list);
+    ep_gc_push_root(&s);
     ep_gc_maybe_collect();
 
     len = length_list(list);
@@ -5215,6 +5295,7 @@ long long contains_string(long long list, long long s) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -5232,8 +5313,12 @@ long long resolve_import_path(long long current_file, long long import_path) {
     ep_gc_push_root(&p);
     ep_gc_push_root(&std_path);
     ep_gc_push_root(&std_path_ep);
+    ep_gc_push_root(&dir);
     ep_gc_push_root(&resolved);
+    ep_gc_push_root(&len);
     ep_gc_push_root(&ext);
+    ep_gc_push_root(&current_file);
+    ep_gc_push_root(&import_path);
     ep_gc_maybe_collect();
 
     p = string_concat(import_path, (long long)"");
@@ -5263,7 +5348,7 @@ long long resolve_import_path(long long current_file, long long import_path) {
     ret_val = string_concat(resolved, (long long)".ep");
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(5);
+    ep_gc_pop_roots(9);
     return ret_val;
 }
 
@@ -5335,13 +5420,55 @@ long long parse_all_modules(long long current_file, long long parsed_files, long
     long long ret_val = 0;
 
     ep_gc_push_root(&source);
+    ep_gc_push_root(&tokens);
     ep_gc_push_root(&state);
+    ep_gc_push_root(&program_ast);
+    ep_gc_push_root(&imports);
+    ep_gc_push_root(&externals);
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&e_idx);
+    ep_gc_push_root(&ext);
+    ep_gc_push_root(&f_idx);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&sd);
+    ep_gc_push_root(&sd_idx);
+    ep_gc_push_root(&ed);
+    ep_gc_push_root(&ed_idx);
+    ep_gc_push_root(&md);
+    ep_gc_push_root(&md_idx);
+    ep_gc_push_root(&td);
+    ep_gc_push_root(&td_idx);
+    ep_gc_push_root(&ti);
+    ep_gc_push_root(&ti_idx);
+    ep_gc_push_root(&tc);
+    ep_gc_push_root(&tc_idx);
+    ep_gc_push_root(&i_idx);
+    ep_gc_push_root(&imp_pair);
+    ep_gc_push_root(&imp);
     ep_gc_push_root(&imp_alias);
     ep_gc_push_root(&resolved_path);
     ep_gc_push_root(&mod_funcs);
     ep_gc_push_root(&mod_externals);
+    ep_gc_push_root(&mf_i);
+    ep_gc_push_root(&mfunc);
+    ep_gc_push_root(&acopy);
+    ep_gc_push_root(&mc_i);
     ep_gc_push_root(&aname);
+    ep_gc_push_root(&me_i);
+    ep_gc_push_root(&mext);
+    ep_gc_push_root(&ecopy);
+    ep_gc_push_root(&me_ci);
     ep_gc_push_root(&ename);
+    ep_gc_push_root(&current_file);
+    ep_gc_push_root(&parsed_files);
+    ep_gc_push_root(&all_functions);
+    ep_gc_push_root(&all_externals);
+    ep_gc_push_root(&all_struct_defs);
+    ep_gc_push_root(&all_enum_defs);
+    ep_gc_push_root(&all_method_defs);
+    ep_gc_push_root(&all_trait_defs);
+    ep_gc_push_root(&all_trait_impls);
+    ep_gc_push_root(&all_constants);
     ep_gc_maybe_collect();
 
     has_parsed = contains_string(parsed_files, current_file);
@@ -5507,7 +5634,7 @@ long long parse_all_modules(long long current_file, long long parsed_files, long
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(8);
+    ep_gc_pop_roots(50);
     return ret_val;
 }
 
@@ -5553,6 +5680,9 @@ long long _main() {
     long long ext_cry = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&first_arg);
+    ep_gc_push_root(&is_test_mode);
+    ep_gc_push_root(&input_path);
     ep_gc_push_root(&stem);
     ep_gc_push_root(&all_functions);
     ep_gc_push_root(&all_externals);
@@ -5564,11 +5694,18 @@ long long _main() {
     ep_gc_push_root(&all_constants);
     ep_gc_push_root(&parsed_files);
     ep_gc_push_root(&f_names);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&name);
     ep_gc_push_root(&empty_imports);
     ep_gc_push_root(&program_ast);
+    ep_gc_push_root(&c_code);
     ep_gc_push_root(&c_path);
     ep_gc_push_root(&compile_cmd);
+    ep_gc_push_root(&pf_idx);
+    ep_gc_push_root(&pf);
     ep_gc_push_root(&pf_str);
+    ep_gc_push_root(&pf_len_str);
     ep_gc_push_root(&ext_sql);
     ep_gc_push_root(&ext_crypto);
     ep_gc_push_root(&ext_gui);
@@ -5721,7 +5858,7 @@ long long _main() {
     goto L_cleanup;
     }
 L_cleanup:
-    ep_gc_pop_roots(20);
+    ep_gc_pop_roots(30);
     return ret_val;
 }
 
@@ -5731,6 +5868,10 @@ long long create_token(long long type, long long value, long long line, long lon
     long long ret_val = 0;
 
     ep_gc_push_root(&tok);
+    ep_gc_push_root(&type);
+    ep_gc_push_root(&value);
+    ep_gc_push_root(&line);
+    ep_gc_push_root(&col);
     ep_gc_maybe_collect();
 
     tok = create_list();
@@ -5742,51 +5883,59 @@ long long create_token(long long type, long long value, long long line, long lon
     tok = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
 long long get_token_type(long long tok) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
     ep_gc_maybe_collect();
 
     ret_val = get_list(tok, 0LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long get_token_value(long long tok) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
     ep_gc_maybe_collect();
 
     ret_val = get_list(tok, 1LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long get_token_line(long long tok) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
     ep_gc_maybe_collect();
 
     ret_val = get_list(tok, 2LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long get_token_col(long long tok) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
     ep_gc_maybe_collect();
 
     ret_val = get_list(tok, 3LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
@@ -5804,6 +5953,11 @@ long long match_next_word(long long source, long long start_pos, long long next_
     long long is_id_part = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&p);
+    ep_gc_push_root(&nw_len);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&source);
+    ep_gc_push_root(&next_word);
     ep_gc_maybe_collect();
 
     p = start_pos;
@@ -5843,6 +5997,7 @@ long long match_next_word(long long source, long long start_pos, long long next_
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -5911,12 +6066,39 @@ long long lex_string_body(long long source, long long pos0, long long source_len
     long long okr3 = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&pos);
+    ep_gc_push_root(&col);
     ep_gc_push_root(&str_chars);
+    ep_gc_push_root(&err);
+    ep_gc_push_root(&ch);
     ep_gc_push_root(&lit);
+    ep_gc_push_root(&t1);
+    ep_gc_push_root(&t2);
+    ep_gc_push_root(&t3);
+    ep_gc_push_root(&t4);
+    ep_gc_push_root(&t5);
+    ep_gc_push_root(&t6);
+    ep_gc_push_root(&t7);
+    ep_gc_push_root(&t8);
     ep_gc_push_root(&expr_chars);
+    ep_gc_push_root(&ec);
+    ep_gc_push_root(&sc);
+    ep_gc_push_root(&qc);
     ep_gc_push_root(&expr_src);
+    ep_gc_push_root(&expr_tokens);
+    ep_gc_push_root(&ei);
+    ep_gc_push_root(&et);
+    ep_gc_push_root(&t9);
+    ep_gc_push_root(&t10);
+    ep_gc_push_root(&esc_ch);
     ep_gc_push_root(&lit2);
+    ep_gc_push_root(&tokf);
+    ep_gc_push_root(&tcp);
     ep_gc_push_root(&res);
+    ep_gc_push_root(&source);
+    ep_gc_push_root(&tokens);
+    ep_gc_push_root(&current_line);
+    ep_gc_push_root(&start_col);
     ep_gc_maybe_collect();
 
     pos = (pos0 + 1LL);
@@ -6121,7 +6303,7 @@ long long lex_string_body(long long source, long long pos0, long long source_len
     res = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(6);
+    ep_gc_pop_roots(33);
     return ret_val;
 }
 
@@ -6130,6 +6312,11 @@ long long lex_is_phrase2(long long source, long long pos, long long w1, long lon
     long long p2 = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&p1);
+    ep_gc_push_root(&source);
+    ep_gc_push_root(&pos);
+    ep_gc_push_root(&w1);
+    ep_gc_push_root(&w2);
     ep_gc_maybe_collect();
 
     p1 = match_next_word(source, pos, w1);
@@ -6141,6 +6328,7 @@ long long lex_is_phrase2(long long source, long long pos, long long w1, long lon
     ret_val = p2;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -6201,8 +6389,36 @@ long long tokenize_source(long long source) {
     long long ret_val = 0;
 
     ep_gc_push_root(&tokens);
+    ep_gc_push_root(&source_len);
+    ep_gc_push_root(&pos);
+    ep_gc_push_root(&current_line);
+    ep_gc_push_root(&current_col);
     ep_gc_push_root(&indent_stack);
+    ep_gc_push_root(&spaces);
+    ep_gc_push_root(&stack_len);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&s_len);
+    ep_gc_push_root(&tokens_len);
+    ep_gc_push_root(&last_tok);
+    ep_gc_push_root(&num_start);
+    ep_gc_push_root(&num_type);
+    ep_gc_push_root(&num_len);
     ep_gc_push_root(&num_str);
+    ep_gc_push_root(&id_start);
+    ep_gc_push_root(&id_len);
+    ep_gc_push_root(&id_str);
+    ep_gc_push_root(&tok_type);
+    ep_gc_push_root(&next_p);
+    ep_gc_push_root(&next_p2);
+    ep_gc_push_root(&mp_the);
+    ep_gc_push_root(&dn);
+    ep_gc_push_root(&start_col);
+    ep_gc_push_root(&is_fstring);
+    ep_gc_push_root(&tok_count);
+    ep_gc_push_root(&sres);
+    ep_gc_push_root(&sym_type);
+    ep_gc_push_root(&sym_val);
+    ep_gc_push_root(&source);
     ep_gc_maybe_collect();
 
     tokens = create_list();
@@ -6866,7 +7082,7 @@ long long tokenize_source(long long source) {
     current_col = (current_col + sym_len);
     } else {
     printf("%s\n", (char*)(long long)"Lexer Error: Unknown symbol character code:");
-    printf("%lld\n", c);
+    printf("%s\n", (char*)ep_auto_to_string(c));
     pos = (pos + 1LL);
     current_col = (current_col + 1LL);
     }
@@ -6891,7 +7107,7 @@ long long tokenize_source(long long source) {
     tokens = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(3);
+    ep_gc_pop_roots(31);
     return ret_val;
 }
 
@@ -6903,6 +7119,8 @@ long long parse_int(long long s) {
     long long digit = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&s);
     ep_gc_maybe_collect();
 
     val = 0LL;
@@ -6917,6 +7135,7 @@ long long parse_int(long long s) {
     ret_val = val;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -6926,6 +7145,7 @@ long long make_node_int(long long val) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&val);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -6935,7 +7155,7 @@ long long make_node_int(long long val) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -6945,6 +7165,7 @@ long long make_node_str(long long val) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&val);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -6954,7 +7175,7 @@ long long make_node_str(long long val) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -6964,6 +7185,7 @@ long long make_node_ident(long long name) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&name);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -6973,7 +7195,7 @@ long long make_node_ident(long long name) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -6983,6 +7205,9 @@ long long make_node_binary(long long left, long long op, long long right) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&left);
+    ep_gc_push_root(&op);
+    ep_gc_push_root(&right);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -6994,7 +7219,7 @@ long long make_node_binary(long long left, long long op, long long right) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7004,6 +7229,9 @@ long long make_node_comp(long long left, long long op, long long right) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&left);
+    ep_gc_push_root(&op);
+    ep_gc_push_root(&right);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7015,7 +7243,7 @@ long long make_node_comp(long long left, long long op, long long right) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7025,6 +7253,8 @@ long long make_node_call(long long name, long long args) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&args);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7035,7 +7265,7 @@ long long make_node_call(long long name, long long args) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7045,6 +7275,8 @@ long long make_node_set(long long var, long long expr) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&var);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7055,7 +7287,7 @@ long long make_node_set(long long var, long long expr) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7065,6 +7297,7 @@ long long make_node_return(long long expr) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7074,7 +7307,7 @@ long long make_node_return(long long expr) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7084,6 +7317,7 @@ long long make_node_display(long long expr) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7093,7 +7327,7 @@ long long make_node_display(long long expr) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7103,6 +7337,9 @@ long long make_node_if(long long cond, long long then_b, long long else_b) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&cond);
+    ep_gc_push_root(&then_b);
+    ep_gc_push_root(&else_b);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7114,7 +7351,7 @@ long long make_node_if(long long cond, long long then_b, long long else_b) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7124,6 +7361,8 @@ long long make_node_repeat_while(long long cond, long long body) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&cond);
+    ep_gc_push_root(&body);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7134,7 +7373,7 @@ long long make_node_repeat_while(long long cond, long long body) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7144,6 +7383,10 @@ long long make_node_func(long long name, long long params, long long body, long 
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&is_async);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7156,7 +7399,7 @@ long long make_node_func(long long name, long long params, long long body, long 
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -7166,6 +7409,14 @@ long long make_node_program(long long imports, long long externals, long long fu
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&imports);
+    ep_gc_push_root(&externals);
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&struct_defs);
+    ep_gc_push_root(&enum_defs);
+    ep_gc_push_root(&method_defs);
+    ep_gc_push_root(&trait_defs);
+    ep_gc_push_root(&trait_impls);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7183,7 +7434,7 @@ long long make_node_program(long long imports, long long externals, long long fu
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(9);
     return ret_val;
 }
 
@@ -7193,6 +7444,8 @@ long long make_node_spawn(long long func_name, long long args) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&func_name);
+    ep_gc_push_root(&args);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7203,7 +7456,7 @@ long long make_node_spawn(long long func_name, long long args) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7213,6 +7466,8 @@ long long make_node_send(long long chan, long long val) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&chan);
+    ep_gc_push_root(&val);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7223,7 +7478,7 @@ long long make_node_send(long long chan, long long val) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7251,6 +7506,7 @@ long long make_node_receive(long long chan) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&chan);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7260,7 +7516,7 @@ long long make_node_receive(long long chan) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7270,6 +7526,9 @@ long long make_node_external(long long name, long long params, long long ret_typ
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&ret_type);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7281,7 +7540,7 @@ long long make_node_external(long long name, long long params, long long ret_typ
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7291,6 +7550,7 @@ long long make_node_borrow(long long target) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&target);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7300,7 +7560,7 @@ long long make_node_borrow(long long target) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7310,6 +7570,7 @@ long long make_node_await(long long target) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&target);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7319,7 +7580,7 @@ long long make_node_await(long long target) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7329,6 +7590,9 @@ long long make_node_logical(long long left, long long op, long long right) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&left);
+    ep_gc_push_root(&op);
+    ep_gc_push_root(&right);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7340,7 +7604,7 @@ long long make_node_logical(long long left, long long op, long long right) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7350,6 +7614,8 @@ long long make_node_field_access(long long obj, long long field_name) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&obj);
+    ep_gc_push_root(&field_name);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7360,7 +7626,7 @@ long long make_node_field_access(long long obj, long long field_name) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7370,6 +7636,9 @@ long long make_node_field_set(long long obj, long long field_name, long long val
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&obj);
+    ep_gc_push_root(&field_name);
+    ep_gc_push_root(&val);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7381,7 +7650,7 @@ long long make_node_field_set(long long obj, long long field_name, long long val
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7391,6 +7660,8 @@ long long make_node_struct_create(long long struct_name, long long fields) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&struct_name);
+    ep_gc_push_root(&fields);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7401,7 +7672,7 @@ long long make_node_struct_create(long long struct_name, long long fields) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7411,6 +7682,9 @@ long long make_node_method_call(long long obj, long long method_name, long long 
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&obj);
+    ep_gc_push_root(&method_name);
+    ep_gc_push_root(&args);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7422,7 +7696,7 @@ long long make_node_method_call(long long obj, long long method_name, long long 
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7432,6 +7706,8 @@ long long make_node_enum_create(long long variant_name, long long args) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&variant_name);
+    ep_gc_push_root(&args);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7442,7 +7718,7 @@ long long make_node_enum_create(long long variant_name, long long args) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7452,6 +7728,8 @@ long long make_node_match(long long expr, long long arms) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&arms);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7462,7 +7740,7 @@ long long make_node_match(long long expr, long long arms) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7472,6 +7750,9 @@ long long make_node_for_each(long long var_name, long long iter_expr, long long 
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&iter_expr);
+    ep_gc_push_root(&body);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7483,7 +7764,7 @@ long long make_node_for_each(long long var_name, long long iter_expr, long long 
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7529,6 +7810,7 @@ long long make_node_bool(long long val) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&val);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7538,7 +7820,7 @@ long long make_node_bool(long long val) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7548,6 +7830,7 @@ long long make_node_unary_not(long long expr) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7557,7 +7840,7 @@ long long make_node_unary_not(long long expr) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7567,6 +7850,7 @@ long long make_node_try(long long expr) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7576,7 +7860,7 @@ long long make_node_try(long long expr) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7586,6 +7870,8 @@ long long make_node_closure(long long params, long long body) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&body);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7596,7 +7882,7 @@ long long make_node_closure(long long params, long long body) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7606,6 +7892,7 @@ long long make_node_list_lit(long long elements) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&elements);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7615,7 +7902,7 @@ long long make_node_list_lit(long long elements) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7625,6 +7912,7 @@ long long make_node_expr_stmt(long long expr) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7634,7 +7922,7 @@ long long make_node_expr_stmt(long long expr) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7644,6 +7932,8 @@ long long make_node_struct_def(long long name, long long fields) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&fields);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7654,7 +7944,7 @@ long long make_node_struct_def(long long name, long long fields) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7664,6 +7954,8 @@ long long make_node_enum_def(long long name, long long variants) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&variants);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7674,7 +7966,7 @@ long long make_node_enum_def(long long name, long long variants) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7684,6 +7976,10 @@ long long make_node_method_def(long long method_name, long long struct_name, lon
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&method_name);
+    ep_gc_push_root(&struct_name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&body);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7696,7 +7992,7 @@ long long make_node_method_def(long long method_name, long long struct_name, lon
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -7706,6 +8002,8 @@ long long make_node_trait_def(long long name, long long method_sigs) {
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&method_sigs);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7716,7 +8014,7 @@ long long make_node_trait_def(long long name, long long method_sigs) {
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7726,6 +8024,9 @@ long long make_node_trait_impl(long long trait_name, long long type_name, long l
     long long ret_val = 0;
 
     ep_gc_push_root(&node);
+    ep_gc_push_root(&trait_name);
+    ep_gc_push_root(&type_name);
+    ep_gc_push_root(&methods);
     ep_gc_maybe_collect();
 
     node = create_list();
@@ -7737,7 +8038,7 @@ long long make_node_trait_impl(long long trait_name, long long type_name, long l
     node = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -7747,6 +8048,7 @@ long long create_parser_state(long long tokens) {
     long long ret_val = 0;
 
     ep_gc_push_root(&state);
+    ep_gc_push_root(&tokens);
     ep_gc_maybe_collect();
 
     state = create_list();
@@ -7757,7 +8059,7 @@ long long create_parser_state(long long tokens) {
     state = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7765,56 +8067,67 @@ long long set_parser_error(long long state) {
     long long ok = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ok = set_list(state, 2LL, 1LL);
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long get_parser_error(long long state) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ret_val = get_list(state, 2LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long get_state_tokens(long long state) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ret_val = get_list(state, 0LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long get_state_pos(long long state) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ret_val = get_list(state, 1LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long set_state_pos(long long state, long long new_pos) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&new_pos);
     ep_gc_maybe_collect();
 
     ret_val = set_list(state, 1LL, new_pos);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7837,6 +8150,9 @@ long long peek_token(long long state) {
     long long tokens_len = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tokens);
+    ep_gc_push_root(&pos);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     tokens = get_state_tokens(state);
@@ -7849,6 +8165,7 @@ long long peek_token(long long state) {
     ret_val = get_eof_token();
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7858,6 +8175,9 @@ long long peek_token_at(long long state, long long offset) {
     long long tokens_len = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tokens);
+    ep_gc_push_root(&pos);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     tokens = get_state_tokens(state);
@@ -7870,6 +8190,7 @@ long long peek_token_at(long long state, long long offset) {
     ret_val = get_eof_token();
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7881,6 +8202,9 @@ long long advance_token(long long state) {
     long long ok = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tokens);
+    ep_gc_push_root(&pos);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     tokens = get_state_tokens(state);
@@ -7895,6 +8219,7 @@ long long advance_token(long long state) {
     ret_val = get_eof_token();
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -7904,6 +8229,8 @@ long long expect_token_type(long long state, long long expected_type) {
     long long ok = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     tok = advance_token(state);
@@ -7913,15 +8240,16 @@ long long expect_token_type(long long state, long long expected_type) {
     goto L_cleanup;
     }
     printf("%s\n", (char*)(long long)"Parser Error: Expected token type:");
-    printf("%lld\n", expected_type);
+    printf("%s\n", (char*)ep_auto_to_string(expected_type));
     printf("%s\n", (char*)(long long)"Found type:");
-    printf("%lld\n", actual_type);
+    printf("%s\n", (char*)ep_auto_to_string(actual_type));
     printf("%s\n", (char*)(long long)"At line:");
-    printf("%lld\n", get_token_line(tok));
+    printf("%s\n", (char*)ep_auto_to_string(get_token_line(tok)));
     ok = set_parser_error(state);
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7929,6 +8257,7 @@ long long get_token_precedence(long long tok) {
     long long t = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
     ep_gc_maybe_collect();
 
     t = get_token_type(tok);
@@ -7963,6 +8292,7 @@ long long get_token_precedence(long long tok) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
@@ -7972,6 +8302,8 @@ long long skip_newlines(long long state) {
     long long dummy = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     loop = 1LL;
@@ -7986,6 +8318,7 @@ long long skip_newlines(long long state) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -7993,6 +8326,7 @@ long long is_uppercase_start(long long name) {
     long long ch = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&name);
     ep_gc_maybe_collect();
 
     ch = get_character((char*)name, 0LL);
@@ -8003,6 +8337,7 @@ long long is_uppercase_start(long long name) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
@@ -8027,6 +8362,22 @@ long long parse_param_list(long long state) {
     long long tok_ptype3 = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&next_tok);
+    ep_gc_push_root(&next_tok2);
+    ep_gc_push_root(&is_borrow);
+    ep_gc_push_root(&tok_param);
+    ep_gc_push_root(&param_name);
+    ep_gc_push_root(&ptype);
+    ep_gc_push_root(&next_as);
+    ep_gc_push_root(&tok_ptype);
+    ep_gc_push_root(&param_node);
+    ep_gc_push_root(&tok_and);
+    ep_gc_push_root(&next_tok3);
+    ep_gc_push_root(&is_borrow3);
+    ep_gc_push_root(&ptype3);
+    ep_gc_push_root(&tok_ptype3);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     params = (create_list() + 0LL);
@@ -8084,8 +8435,10 @@ long long parse_param_list(long long state) {
     }
     }
     ret_val = params;
+    params = 0;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(16);
     return ret_val;
 }
 
@@ -8133,6 +8486,40 @@ long long parse_program(long long state) {
     long long prog = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&imports);
+    ep_gc_push_root(&externals);
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&struct_defs);
+    ep_gc_push_root(&enum_defs);
+    ep_gc_push_root(&method_defs);
+    ep_gc_push_root(&trait_defs);
+    ep_gc_push_root(&trait_impls);
+    ep_gc_push_root(&top_constants);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&tok_path);
+    ep_gc_push_root(&path_val);
+    ep_gc_push_root(&alias_val);
+    ep_gc_push_root(&peek_as);
+    ep_gc_push_root(&tok_alias);
+    ep_gc_push_root(&imp_pair);
+    ep_gc_push_root(&tok_name);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&ret_type);
+    ep_gc_push_root(&next_tok);
+    ep_gc_push_root(&ret_tok);
+    ep_gc_push_root(&ext_node);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&tok2);
+    ep_gc_push_root(&struct_def);
+    ep_gc_push_root(&enum_def);
+    ep_gc_push_root(&trait_def);
+    ep_gc_push_root(&tok3);
+    ep_gc_push_root(&method_def);
+    ep_gc_push_root(&impl_node);
+    ep_gc_push_root(&const_stmt);
+    ep_gc_push_root(&prog);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     imports = (create_list() + 0LL);
@@ -8173,7 +8560,7 @@ long long parse_program(long long state) {
     ok = append_list(imports, imp_pair);
     } else {
     printf("%s\n", (char*)(long long)"Parser Error: Expected string literal after import at line:");
-    printf("%lld\n", get_token_line(tok_path));
+    printf("%s\n", (char*)ep_auto_to_string(get_token_line(tok_path)));
     loop = 0LL;
     }
     } else {
@@ -8243,7 +8630,7 @@ long long parse_program(long long state) {
     ok = append_list(top_constants, const_stmt);
     } else {
     printf("%s\n", (char*)(long long)"Parser Error: Unexpected token at top level:");
-    printf("%lld\n", t);
+    printf("%s\n", (char*)ep_auto_to_string(t));
     ok = set_parser_error(state);
     loop = 0LL;
     }
@@ -8258,8 +8645,10 @@ long long parse_program(long long state) {
     prog = (make_node_program(imports, externals, funcs, struct_defs, enum_defs, method_defs, trait_defs, trait_impls) + 0LL);
     ok = set_list(prog, 9LL, top_constants);
     ret_val = prog;
+    prog = 0;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(34);
     return ret_val;
 }
 
@@ -8282,6 +8671,19 @@ long long parse_struct_def(long long state) {
     long long tok_ded = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok_name);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&fields);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&field_name_tok);
+    ep_gc_push_root(&field_name);
+    ep_gc_push_root(&field_type);
+    ep_gc_push_root(&field_default);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&type_tok);
+    ep_gc_push_root(&field_node);
+    ep_gc_push_root(&tok_ded);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ok = expect_token_type(state, 1LL);
@@ -8337,6 +8739,7 @@ long long parse_struct_def(long long state) {
     ret_val = make_node_struct_def(name, fields);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(13);
     return ret_val;
 }
 
@@ -8365,6 +8768,24 @@ long long parse_enum_def(long long state) {
     long long tok_ded = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok_name);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&variants);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&vname_tok);
+    ep_gc_push_root(&vname);
+    ep_gc_push_root(&vfields);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&vf_tok);
+    ep_gc_push_root(&vf_name);
+    ep_gc_push_root(&vf_type);
+    ep_gc_push_root(&next_as);
+    ep_gc_push_root(&vt_tok);
+    ep_gc_push_root(&vf_node);
+    ep_gc_push_root(&next_and);
+    ep_gc_push_root(&v_node);
+    ep_gc_push_root(&tok_ded);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ok = expect_token_type(state, 1LL);
@@ -8446,6 +8867,7 @@ long long parse_enum_def(long long state) {
     ret_val = make_node_enum_def(name, variants);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(18);
     return ret_val;
 }
 
@@ -8461,6 +8883,14 @@ long long parse_method_def(long long state) {
     long long body = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok_method);
+    ep_gc_push_root(&method_name);
+    ep_gc_push_root(&tok_struct);
+    ep_gc_push_root(&struct_name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&next_ret);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ok = expect_token_type(state, 1LL);
@@ -8481,6 +8911,7 @@ long long parse_method_def(long long state) {
     ret_val = make_node_method_def(method_name, struct_name, params, body);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(8);
     return ret_val;
 }
 
@@ -8502,6 +8933,18 @@ long long parse_trait_def(long long state) {
     long long tok_ded = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok_name);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&method_sigs);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&sig_tok);
+    ep_gc_push_root(&sig_name);
+    ep_gc_push_root(&sig_params);
+    ep_gc_push_root(&next_ret);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&sig_node);
+    ep_gc_push_root(&tok_ded);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ok = expect_token_type(state, 1LL);
@@ -8553,6 +8996,7 @@ long long parse_trait_def(long long state) {
     ret_val = make_node_trait_def(name, method_sigs);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(12);
     return ret_val;
 }
 
@@ -8571,6 +9015,15 @@ long long parse_trait_impl(long long state) {
     long long tok_ded = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok_trait);
+    ep_gc_push_root(&trait_name);
+    ep_gc_push_root(&tok_type);
+    ep_gc_push_root(&type_name);
+    ep_gc_push_root(&methods);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&method);
+    ep_gc_push_root(&tok_ded);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ok = expect_token_type(state, 58LL);
@@ -8609,6 +9062,7 @@ long long parse_trait_impl(long long state) {
     ret_val = make_node_trait_impl(trait_name, type_name, methods);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(9);
     return ret_val;
 }
 
@@ -8626,6 +9080,17 @@ long long parse_function_async(long long state, long long is_async) {
     long long fnode = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok_name);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&ret_type);
+    ep_gc_push_root(&next_ret);
+    ep_gc_push_root(&ret_tok);
+    ep_gc_push_root(&tok_nl);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&fnode);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&is_async);
     ep_gc_maybe_collect();
 
     ok = expect_token_type(state, 1LL);
@@ -8648,8 +9113,10 @@ long long parse_function_async(long long state, long long is_async) {
     fnode = (make_node_func(name, params, body, is_async) + 0LL);
     ok = append_list(fnode, ret_type);
     ret_val = fnode;
+    fnode = 0;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(11);
     return ret_val;
 }
 
@@ -8664,6 +9131,11 @@ long long parse_block(long long state) {
     long long tok_dedent = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&statements);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&tok_dedent);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ok = expect_token_type(state, 29LL);
@@ -8688,11 +9160,13 @@ long long parse_block(long long state) {
     dummy = advance_token(state);
     } else {
     printf("%s\n", (char*)(long long)"Parser Error: Expected DEDENT, found:");
-    printf("%lld\n", get_token_type(tok_dedent));
+    printf("%s\n", (char*)ep_auto_to_string(get_token_type(tok_dedent)));
     }
     ret_val = statements;
+    statements = 0;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -8722,6 +9196,26 @@ long long parse_statement(long long state) {
     long long chan = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&tok_var);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&field_tok);
+    ep_gc_push_root(&field_name);
+    ep_gc_push_root(&val);
+    ep_gc_push_root(&obj);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&next_as);
+    ep_gc_push_root(&cond);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&tok_func);
+    ep_gc_push_root(&func_name);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&next_tok);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&next_tok3);
+    ep_gc_push_root(&chan);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     tok = peek_token(state);
@@ -8856,6 +9350,7 @@ long long parse_statement(long long state) {
     }
     }
 L_cleanup:
+    ep_gc_pop_roots(20);
     return ret_val;
 }
 
@@ -8870,6 +9365,13 @@ long long parse_if_statement(long long state) {
     long long chained_if = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&cond);
+    ep_gc_push_root(&then_branch);
+    ep_gc_push_root(&else_branch);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&next2);
+    ep_gc_push_root(&chained_if);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     dummy = advance_token(state);
@@ -8895,6 +9397,7 @@ long long parse_if_statement(long long state) {
     ret_val = make_node_if(cond, then_branch, else_branch);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(7);
     return ret_val;
 }
 
@@ -8919,6 +9422,20 @@ long long parse_match_statement(long long state) {
     long long tok_ded = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&variant_tok);
+    ep_gc_push_root(&variant_name);
+    ep_gc_push_root(&pat_kind);
+    ep_gc_push_root(&bindings);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&bind_tok);
+    ep_gc_push_root(&next_and);
+    ep_gc_push_root(&arm_body);
+    ep_gc_push_root(&arm_node);
+    ep_gc_push_root(&tok_ded);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     dummy = advance_token(state);
@@ -8982,6 +9499,7 @@ long long parse_match_statement(long long state) {
     ret_val = make_node_match(expr, arms);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(14);
     return ret_val;
 }
 
@@ -8994,6 +9512,11 @@ long long parse_for_each_statement(long long state) {
     long long body = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&var_tok);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&iter_expr);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     dummy = advance_token(state);
@@ -9008,6 +9531,7 @@ long long parse_for_each_statement(long long state) {
     ret_val = make_node_for_each(var_name, iter_expr, body);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -9040,6 +9564,21 @@ long long parse_expr(long long state, long long precedence) {
     long long call_name = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&left);
+    ep_gc_push_root(&next_tok);
+    ep_gc_push_root(&member_tok);
+    ep_gc_push_root(&member_name);
+    ep_gc_push_root(&next2);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&next3);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&next4);
+    ep_gc_push_root(&op_tok);
+    ep_gc_push_root(&op);
+    ep_gc_push_root(&right_prec);
+    ep_gc_push_root(&right);
+    ep_gc_push_root(&call_name);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     left = (parse_prefix(state) + 0LL);
@@ -9183,8 +9722,10 @@ long long parse_expr(long long state, long long precedence) {
     }
     }
     ret_val = left;
+    left = 0;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(15);
     return ret_val;
 }
 
@@ -9219,6 +9760,27 @@ long long parse_prefix(long long state) {
     long long range_args = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&val);
+    ep_gc_push_root(&fnode);
+    ep_gc_push_root(&chan);
+    ep_gc_push_root(&target);
+    ep_gc_push_root(&operand);
+    ep_gc_push_root(&try_expr);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&next_tok);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&next_tok2);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&next_tok3);
+    ep_gc_push_root(&next2);
+    ep_gc_push_root(&vargs);
+    ep_gc_push_root(&varg);
+    ep_gc_push_root(&next3);
+    ep_gc_push_root(&start_expr);
+    ep_gc_push_root(&end_expr);
+    ep_gc_push_root(&range_args);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     tok = advance_token(state);
@@ -9370,11 +9932,12 @@ long long parse_prefix(long long state) {
     goto L_cleanup;
     }
     printf("%s\n", (char*)(long long)"Parser Error: Expected expression, found token type:");
-    printf("%lld\n", t);
+    printf("%s\n", (char*)ep_auto_to_string(t));
     ok = set_parser_error(state);
     ret_val = (make_node_int(0LL) + 0LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(21);
     return ret_val;
 }
 
@@ -9392,6 +9955,15 @@ long long parse_closure(long long state) {
     long long single = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&p_tok);
+    ep_gc_push_root(&p_name);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&next_and);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&single);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     params = (create_list() + 0LL);
@@ -9432,6 +10004,7 @@ long long parse_closure(long long state) {
     ret_val = make_node_closure(params, body);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(9);
     return ret_val;
 }
 
@@ -9452,6 +10025,17 @@ long long parse_struct_create(long long state) {
     long long tok_ded = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&tok_name);
+    ep_gc_push_root(&struct_name);
+    ep_gc_push_root(&fields);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&tok);
+    ep_gc_push_root(&fname_tok);
+    ep_gc_push_root(&fname);
+    ep_gc_push_root(&fval);
+    ep_gc_push_root(&fpair);
+    ep_gc_push_root(&tok_ded);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     tok_name = advance_token(state);
@@ -9491,6 +10075,7 @@ long long parse_struct_create(long long state) {
     ret_val = make_node_struct_create(struct_name, fields);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(11);
     return ret_val;
 }
 
@@ -9504,6 +10089,10 @@ long long parse_list_literal(long long state) {
     long long dummy = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&elements);
+    ep_gc_push_root(&next);
+    ep_gc_push_root(&elem);
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     elements = (create_list() + 0LL);
@@ -9534,6 +10123,7 @@ long long parse_list_literal(long long state) {
     ret_val = make_node_list_lit(elements);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -9541,6 +10131,7 @@ long long check_lit_category(long long expr) {
     long long t = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     t = get_list(expr, 0LL);
@@ -9563,6 +10154,7 @@ long long check_lit_category(long long expr) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
@@ -9585,6 +10177,13 @@ long long check_expr(long long expr, long long errs, long long in_spawn_arg) {
     long long oka = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&elems);
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&el);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&ai);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&errs);
     ep_gc_maybe_collect();
 
     if (expr == 0LL) {
@@ -9649,6 +10248,7 @@ long long check_expr(long long expr, long long errs, long long in_spawn_arg) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(7);
     return ret_val;
 }
 
@@ -9680,7 +10280,16 @@ long long check_stmts(long long stmts, long long errs) {
     long long okam = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
     ep_gc_push_root(&tgt);
+    ep_gc_push_root(&eb);
+    ep_gc_push_root(&sargs);
+    ep_gc_push_root(&si);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&ari);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&errs);
     ep_gc_maybe_collect();
 
     n = length_list(stmts);
@@ -9740,7 +10349,7 @@ long long check_stmts(long long stmts, long long errs) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(10);
     return ret_val;
 }
 
@@ -9753,7 +10362,11 @@ long long check_function(long long func, long long errs) {
     long long okb = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&pi);
     ep_gc_push_root(&pname);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&errs);
     ep_gc_maybe_collect();
 
     params = get_list(func, 2LL);
@@ -9770,7 +10383,7 @@ long long check_function(long long func, long long errs) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -9781,6 +10394,10 @@ long long en_arg_type(long long arg, long long vk, long long vo) {
     long long ret_val = 0;
 
     ep_gc_push_root(&vn);
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&vk);
+    ep_gc_push_root(&vo);
     ep_gc_maybe_collect();
 
     if (arg == 0LL) {
@@ -9820,7 +10437,7 @@ long long en_arg_type(long long arg, long long vk, long long vo) {
     ret_val = (long long)"";
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -9830,6 +10447,11 @@ long long en_field_type_at(long long variant, long long ai, long long vk, long l
     long long ret_val = 0;
 
     ep_gc_push_root(&vn);
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&variant);
+    ep_gc_push_root(&ai);
+    ep_gc_push_root(&vk);
+    ep_gc_push_root(&vf);
     ep_gc_maybe_collect();
 
     vn = string_concat(variant, (long long)"");
@@ -9848,7 +10470,7 @@ long long en_field_type_at(long long variant, long long ai, long long vk, long l
     ret_val = (long long)"";
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -9859,6 +10481,10 @@ long long en_type_conflict(long long dt, long long arg, long long vk, long long 
 
     ep_gc_push_root(&dts);
     ep_gc_push_root(&at);
+    ep_gc_push_root(&dt);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&vk);
+    ep_gc_push_root(&vo);
     ep_gc_maybe_collect();
 
     dts = string_concat(dt, (long long)"");
@@ -9910,7 +10536,7 @@ long long en_type_conflict(long long dt, long long arg, long long vk, long long 
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(2);
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -9945,14 +10571,31 @@ long long en_check_expr(long long expr, long long errs, long long vk, long long 
     long long okc = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&variant);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&ai);
+    ep_gc_push_root(&arg);
     ep_gc_push_root(&ft);
     ep_gc_push_root(&at);
     ep_gc_push_root(&msg);
+    ep_gc_push_root(&bl);
+    ep_gc_push_root(&br);
     ep_gc_push_root(&blt);
     ep_gc_push_root(&brt);
     ep_gc_push_root(&cname);
+    ep_gc_push_root(&cargs);
+    ep_gc_push_root(&fi);
+    ep_gc_push_root(&pi);
     ep_gc_push_root(&dt);
     ep_gc_push_root(&amsg);
+    ep_gc_push_root(&ci);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&errs);
+    ep_gc_push_root(&vk);
+    ep_gc_push_root(&vo);
+    ep_gc_push_root(&vf);
+    ep_gc_push_root(&fk);
+    ep_gc_push_root(&fp);
     ep_gc_maybe_collect();
 
     if (expr == 0LL) {
@@ -10070,7 +10713,7 @@ long long en_check_expr(long long expr, long long errs, long long vk, long long 
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(8);
+    ep_gc_pop_roots(25);
     return ret_val;
 }
 
@@ -10085,7 +10728,20 @@ long long en_check_stmts(long long stmts, long long errs, long long vk, long lon
     long long ari = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&stmt);
     ep_gc_push_root(&rmsg);
+    ep_gc_push_root(&eb);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&ari);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&errs);
+    ep_gc_push_root(&vk);
+    ep_gc_push_root(&vo);
+    ep_gc_push_root(&vf);
+    ep_gc_push_root(&fk);
+    ep_gc_push_root(&fp);
+    ep_gc_push_root(&drt);
     ep_gc_maybe_collect();
 
     i = 0LL;
@@ -10135,7 +10791,7 @@ long long en_check_stmts(long long stmts, long long errs, long long vk, long lon
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(14);
     return ret_val;
 }
 
@@ -10185,11 +10841,36 @@ long long check_program(long long program) {
     ep_gc_push_root(&en_vk);
     ep_gc_push_root(&en_vo);
     ep_gc_push_root(&en_vf);
+    ep_gc_push_root(&enums);
+    ep_gc_push_root(&ei);
+    ep_gc_push_root(&edef);
+    ep_gc_push_root(&ename);
+    ep_gc_push_root(&evs);
+    ep_gc_push_root(&evi);
+    ep_gc_push_root(&ev);
     ep_gc_push_root(&fts);
+    ep_gc_push_root(&fields);
+    ep_gc_push_root(&fi);
     ep_gc_push_root(&en_fk);
     ep_gc_push_root(&en_fp);
+    ep_gc_push_root(&en_funcs);
+    ep_gc_push_root(&bfi);
+    ep_gc_push_root(&bfn);
     ep_gc_push_root(&pts);
+    ep_gc_push_root(&bpl);
+    ep_gc_push_root(&bpi);
+    ep_gc_push_root(&ptname);
+    ep_gc_push_root(&efi);
+    ep_gc_push_root(&efn);
     ep_gc_push_root(&edrt);
+    ep_gc_push_root(&en_methods);
+    ep_gc_push_root(&emi);
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&methods);
+    ep_gc_push_root(&mi);
+    ep_gc_push_root(&mdef);
+    ep_gc_push_root(&program);
     ep_gc_maybe_collect();
 
     errs = create_list();
@@ -10290,7 +10971,7 @@ long long check_program(long long program) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(9);
+    ep_gc_pop_roots(34);
     return ret_val;
 }
 
@@ -10318,6 +10999,14 @@ long long opt_fold_expr(long long expr) {
     long long okle = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&left);
+    ep_gc_push_root(&right);
+    ep_gc_push_root(&res);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&ai);
+    ep_gc_push_root(&elems);
+    ep_gc_push_root(&ei);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     if (expr == 0LL) {
@@ -10368,12 +11057,14 @@ long long opt_fold_expr(long long expr) {
     }
     }
     ret_val = expr;
+    expr = 0;
     goto L_cleanup;
     }
     if ((t == 5LL || t == 14LL)) {
     ok5l = set_list(expr, 1LL, opt_fold_expr(get_list(expr, 1LL)));
     ok5r = set_list(expr, 3LL, opt_fold_expr(get_list(expr, 3LL)));
     ret_val = expr;
+    expr = 0;
     goto L_cleanup;
     }
     if (t == 6LL) {
@@ -10385,11 +11076,13 @@ long long opt_fold_expr(long long expr) {
     ai = (ai + 1LL);
     }
     ret_val = expr;
+    expr = 0;
     goto L_cleanup;
     }
     if ((((t == 18LL || t == 21LL) || t == 32LL) || t == 33LL)) {
     ok1c = set_list(expr, 1LL, opt_fold_expr(get_list(expr, 1LL)));
     ret_val = expr;
+    expr = 0;
     goto L_cleanup;
     }
     if (t == 35LL) {
@@ -10401,11 +11094,14 @@ long long opt_fold_expr(long long expr) {
     ei = (ei + 1LL);
     }
     ret_val = expr;
+    expr = 0;
     goto L_cleanup;
     }
     ret_val = expr;
+    expr = 0;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(8);
     return ret_val;
 }
 
@@ -10431,6 +11127,12 @@ long long opt_fold_stmts(long long stmts) {
     long long okam = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&eb);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&ari);
+    ep_gc_push_root(&stmts);
     ep_gc_maybe_collect();
 
     n = length_list(stmts);
@@ -10477,6 +11179,7 @@ long long opt_fold_stmts(long long stmts) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -10491,6 +11194,11 @@ long long optimize_program(long long program) {
     long long okm = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&methods);
+    ep_gc_push_root(&mi);
+    ep_gc_push_root(&program);
     ep_gc_maybe_collect();
 
     funcs = get_list(program, 3LL);
@@ -10512,6 +11220,7 @@ long long optimize_program(long long program) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -10523,6 +11232,10 @@ long long map_get(long long keys, long long values, long long key) {
     long long ret_val = 0;
 
     ep_gc_push_root(&key_str);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&keys);
+    ep_gc_push_root(&values);
+    ep_gc_push_root(&key);
     ep_gc_maybe_collect();
 
     key_str = string_concat(key, (long long)"");
@@ -10539,7 +11252,7 @@ long long map_get(long long keys, long long values, long long key) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -10550,6 +11263,9 @@ long long map_contains_key(long long keys, long long key) {
     long long ret_val = 0;
 
     ep_gc_push_root(&key_str);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&keys);
+    ep_gc_push_root(&key);
     ep_gc_maybe_collect();
 
     key_str = string_concat(key, (long long)"");
@@ -10565,7 +11281,7 @@ long long map_contains_key(long long keys, long long key) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -10598,6 +11314,19 @@ long long collect_idents_expr(long long expr, long long out_names) {
     long long okl2 = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&a_i);
+    ep_gc_push_root(&fields);
+    ep_gc_push_root(&f_i);
+    ep_gc_push_root(&fpair);
+    ep_gc_push_root(&margs);
+    ep_gc_push_root(&m_i);
+    ep_gc_push_root(&eargs);
+    ep_gc_push_root(&e_i);
+    ep_gc_push_root(&elems);
+    ep_gc_push_root(&l_i);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&out_names);
     ep_gc_maybe_collect();
 
     if (expr == 0LL) {
@@ -10690,6 +11419,7 @@ long long collect_idents_expr(long long expr, long long out_names) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(13);
     return ret_val;
 }
 
@@ -10726,6 +11456,16 @@ long long collect_idents_stmts(long long stmts, long long out_names) {
     long long okfe2 = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&else_b);
+    ep_gc_push_root(&sargs);
+    ep_gc_push_root(&s_i);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&ar_i);
+    ep_gc_push_root(&arm);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&out_names);
     ep_gc_maybe_collect();
 
     len = length_list(stmts);
@@ -10790,6 +11530,7 @@ long long collect_idents_stmts(long long stmts, long long out_names) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(10);
     return ret_val;
 }
 
@@ -10803,6 +11544,11 @@ long long map_put(long long keys, long long values, long long key, long long val
     long long ret_val = 0;
 
     ep_gc_push_root(&key_str);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&keys);
+    ep_gc_push_root(&values);
+    ep_gc_push_root(&key);
+    ep_gc_push_root(&val);
     ep_gc_maybe_collect();
 
     key_str = string_concat(key, (long long)"");
@@ -10824,7 +11570,7 @@ long long map_put(long long keys, long long values, long long key, long long val
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -10837,6 +11583,9 @@ long long field_slot_index(long long seen, long long name) {
     long long ret_val = 0;
 
     ep_gc_push_root(&name_str);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&seen);
+    ep_gc_push_root(&name);
     ep_gc_maybe_collect();
 
     name_str = string_concat(name, (long long)"");
@@ -10854,7 +11603,7 @@ long long field_slot_index(long long seen, long long name) {
     ret_val = len;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -10869,7 +11618,11 @@ long long string_concat(long long s1, long long s2) {
     long long ret_val = 0;
 
     ep_gc_push_root(&lst);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&idx2);
     ep_gc_push_root(&res);
+    ep_gc_push_root(&s1);
+    ep_gc_push_root(&s2);
     ep_gc_maybe_collect();
 
     lst = create_list();
@@ -10889,7 +11642,7 @@ long long string_concat(long long s1, long long s2) {
     ret_val = res;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(2);
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -10901,6 +11654,7 @@ long long cg_sanitize_name(long long name) {
 
     ep_gc_push_root(&n);
     ep_gc_push_root(&kws);
+    ep_gc_push_root(&name);
     ep_gc_maybe_collect();
 
     n = string_concat(name, (long long)"");
@@ -10963,7 +11717,7 @@ long long cg_sanitize_name(long long name) {
     ret_val = n;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(2);
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -10974,6 +11728,9 @@ long long contains_string_val(long long list, long long s) {
     long long ret_val = 0;
 
     ep_gc_push_root(&key);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&list);
+    ep_gc_push_root(&s);
     ep_gc_maybe_collect();
 
     key = string_concat(s, (long long)"");
@@ -10989,18 +11746,20 @@ long long contains_string_val(long long list, long long s) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
 long long get_fn_c_name(long long func) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&func);
     ep_gc_maybe_collect();
 
     ret_val = cg_sanitize_name(get_list(func, 1LL));
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
@@ -11018,6 +11777,8 @@ long long cg_int_to_str(long long n) {
 
     ep_gc_push_root(&lst);
     ep_gc_push_root(&digits);
+    ep_gc_push_root(&digit);
+    ep_gc_push_root(&d);
     ep_gc_push_root(&res);
     ep_gc_maybe_collect();
 
@@ -11052,7 +11813,7 @@ long long cg_int_to_str(long long n) {
     ret_val = res;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(3);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -11066,7 +11827,10 @@ long long escape_string(long long s) {
     long long ret_val = 0;
 
     ep_gc_push_root(&lst);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&ch);
     ep_gc_push_root(&res);
+    ep_gc_push_root(&s);
     ep_gc_maybe_collect();
 
     lst = create_list();
@@ -11106,7 +11870,7 @@ long long escape_string(long long s) {
     ret_val = res;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(2);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -11122,7 +11886,11 @@ long long join_strings(long long lines) {
     long long ret_val = 0;
 
     ep_gc_push_root(&lst);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&line);
+    ep_gc_push_root(&c_idx);
     ep_gc_push_root(&res);
+    ep_gc_push_root(&lines);
     ep_gc_maybe_collect();
 
     lst = create_list();
@@ -11142,7 +11910,7 @@ long long join_strings(long long lines) {
     ret_val = res;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(2);
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -11177,6 +11945,8 @@ long long create_codegen_state() {
     ok = append_list(state, 0LL);
     ok = append_list(state, 0LL);
     ok = append_list(state, (create_list() + 0LL));
+    ok = append_list(state, (create_list() + 0LL));
+    ok = append_list(state, (create_list() + 0LL));
     ret_val = state;
     state = 0;
     goto L_cleanup;
@@ -11192,6 +11962,9 @@ long long count_awaits_expr(long long expr) {
     long long i = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&expr);
     ep_gc_maybe_collect();
 
     if (expr == 0LL) {
@@ -11225,6 +11998,7 @@ long long count_awaits_expr(long long expr) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -11236,6 +12010,10 @@ long long count_awaits_stmts(long long stmts) {
     long long eb = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&eb);
+    ep_gc_push_root(&stmts);
     ep_gc_maybe_collect();
 
     c = 0LL;
@@ -11269,6 +12047,7 @@ long long count_awaits_stmts(long long stmts) {
     ret_val = c;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -11283,8 +12062,16 @@ long long emit_async_yields_expr(long long state, long long expr, long long var_
     long long i = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&n);
+    ep_gc_push_root(&ns);
     ep_gc_push_root(&inner_str);
     ep_gc_push_root(&line);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
     ep_gc_maybe_collect();
 
     if (expr == 0LL) {
@@ -11334,7 +12121,7 @@ long long emit_async_yields_expr(long long state, long long expr, long long var_
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(2);
+    ep_gc_pop_roots(10);
     return ret_val;
 }
 
@@ -11342,6 +12129,10 @@ long long emit_async_yields_stmt(long long state, long long stmt, long long var_
     long long t = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
     ep_gc_maybe_collect();
 
     t = get_list(stmt, 0LL);
@@ -11356,6 +12147,7 @@ long long emit_async_yields_stmt(long long state, long long stmt, long long var_
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -11364,6 +12156,7 @@ long long type_name_to_code(long long tname) {
     long long ret_val = 0;
 
     ep_gc_push_root(&t);
+    ep_gc_push_root(&tname);
     ep_gc_maybe_collect();
 
     t = string_concat(tname, (long long)"");
@@ -11382,7 +12175,957 @@ long long type_name_to_code(long long tname) {
     ret_val = 1LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(2);
+    return ret_val;
+}
+
+long long param_ann_to_code(long long tname) {
+    long long t = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&t);
+    ep_gc_push_root(&tname);
+    ep_gc_maybe_collect();
+
+    t = string_concat(tname, (long long)"");
+    if ((strcmp((char*)t, (char*)(long long)"Int") == 0)) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if ((strcmp((char*)t, (char*)(long long)"Str") == 0)) {
+    ret_val = 2LL;
+    goto L_cleanup;
+    }
+    if ((strcmp((char*)t, (char*)(long long)"List") == 0)) {
+    ret_val = 4LL;
+    goto L_cleanup;
+    }
+    if ((strcmp((char*)t, (char*)(long long)"Bool") == 0)) {
+    ret_val = 7LL;
+    goto L_cleanup;
+    }
+    if ((strcmp((char*)t, (char*)(long long)"Float") == 0)) {
+    ret_val = 8LL;
+    goto L_cleanup;
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(2);
+    return ret_val;
+}
+
+long long seed_param_types(long long params, long long var_keys, long long var_values) {
+    long long p_len = 0;
+    long long p_idx = 0;
+    long long p_node = 0;
+    long long p_name = 0;
+    long long is_borrow = 0;
+    long long param_type = 0;
+    long long ann_code = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&p_idx);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&p_name);
+    ep_gc_push_root(&param_type);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_maybe_collect();
+
+    p_len = length_list(params);
+    p_idx = 0LL;
+    while (p_idx < p_len) {
+    p_node = get_list(params, p_idx);
+    p_name = get_list(p_node, 0LL);
+    is_borrow = get_list(p_node, 1LL);
+    param_type = 1LL;
+    if (is_borrow == 1LL) {
+    param_type = 5LL;
+    }
+    if (length_list(p_node) > 2LL) {
+    ann_code = param_ann_to_code(get_list(p_node, 2LL));
+    if (ann_code != 0LL) {
+    param_type = ann_code;
+    }
+    }
+    ok = map_put(var_keys, var_values, p_name, param_type);
+    p_idx = (p_idx + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(7);
+    return ret_val;
+}
+
+long long collect_prim_param_flags(long long state, long long program) {
+    long long funcs = 0;
+    long long names = 0;
+    long long flaglists = 0;
+    long long f_len = 0;
+    long long f_i = 0;
+    long long func = 0;
+    long long params = 0;
+    long long flags = 0;
+    long long p_len = 0;
+    long long p_i = 0;
+    long long p_node = 0;
+    long long fl = 0;
+    long long c = 0;
+    long long okf = 0;
+    long long okn = 0;
+    long long okl = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&names);
+    ep_gc_push_root(&flaglists);
+    ep_gc_push_root(&f_i);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&flags);
+    ep_gc_push_root(&p_i);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&fl);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&program);
+    ep_gc_maybe_collect();
+
+    funcs = get_list(program, 3LL);
+    names = get_list(state, 22LL);
+    flaglists = get_list(state, 23LL);
+    f_len = length_list(funcs);
+    f_i = 0LL;
+    while (f_i < f_len) {
+    func = get_list(funcs, f_i);
+    params = get_list(func, 2LL);
+    flags = (create_list() + 0LL);
+    p_len = length_list(params);
+    p_i = 0LL;
+    while (p_i < p_len) {
+    p_node = get_list(params, p_i);
+    fl = 0LL;
+    if (length_list(p_node) > 2LL) {
+    c = param_ann_to_code(get_list(p_node, 2LL));
+    if (((c == 1LL || c == 7LL) || c == 8LL)) {
+    fl = 1LL;
+    }
+    }
+    okf = append_list(flags, fl);
+    p_i = (p_i + 1LL);
+    }
+    okn = append_list(names, get_list(func, 1LL));
+    okl = append_list(flaglists, flags);
+    f_i = (f_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(12);
+    return ret_val;
+}
+
+long long get_prim_param_flags(long long state, long long name) {
+    long long n = 0;
+    long long names = 0;
+    long long len = 0;
+    long long idx = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&n);
+    ep_gc_push_root(&names);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&name);
+    ep_gc_maybe_collect();
+
+    n = string_concat(name, (long long)"");
+    names = get_list(state, 22LL);
+    len = length_list(names);
+    idx = 0LL;
+    while (idx < len) {
+    if ((strcmp((char*)n, (char*)get_list(names, idx)) == 0)) {
+    ret_val = get_list(get_list(state, 23LL), idx);
+    goto L_cleanup;
+    }
+    idx = (idx + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(5);
+    return ret_val;
+}
+
+long long cg_expr_has_var(long long expr, long long vname) {
+    long long t = 0;
+    long long n = 0;
+    long long cn = 0;
+    long long args = 0;
+    long long a_len = 0;
+    long long a_i = 0;
+    long long fields = 0;
+    long long f_len = 0;
+    long long f_i = 0;
+    long long margs = 0;
+    long long m_len = 0;
+    long long m_i = 0;
+    long long eargs = 0;
+    long long e_len = 0;
+    long long e_i = 0;
+    long long elems = 0;
+    long long l_len = 0;
+    long long l_i = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&n);
+    ep_gc_push_root(&cn);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&a_i);
+    ep_gc_push_root(&fields);
+    ep_gc_push_root(&f_i);
+    ep_gc_push_root(&margs);
+    ep_gc_push_root(&m_i);
+    ep_gc_push_root(&eargs);
+    ep_gc_push_root(&e_i);
+    ep_gc_push_root(&elems);
+    ep_gc_push_root(&l_i);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&vname);
+    ep_gc_maybe_collect();
+
+    if (expr == 0LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    t = get_list(expr, 0LL);
+    if (t == 3LL) {
+    n = string_concat(get_list(expr, 1LL), (long long)"");
+    if ((strcmp((char*)n, (char*)vname) == 0)) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (((t == 4LL || t == 5LL) || t == 14LL)) {
+    if (cg_expr_has_var(get_list(expr, 1LL), vname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    ret_val = cg_expr_has_var(get_list(expr, 3LL), vname);
+    goto L_cleanup;
+    }
+    if (t == 6LL) {
+    cn = string_concat(get_list(expr, 1LL), (long long)"");
+    if ((strcmp((char*)cn, (char*)vname) == 0)) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    args = get_list(expr, 2LL);
+    a_len = length_list(args);
+    a_i = 0LL;
+    while (a_i < a_len) {
+    if (cg_expr_has_var(get_list(args, a_i), vname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    a_i = (a_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (((((t == 18LL || t == 20LL) || t == 21LL) || t == 32LL) || t == 33LL)) {
+    ret_val = cg_expr_has_var(get_list(expr, 1LL), vname);
+    goto L_cleanup;
+    }
+    if (t == 22LL) {
+    ret_val = cg_expr_has_var(get_list(expr, 1LL), vname);
+    goto L_cleanup;
+    }
+    if (t == 24LL) {
+    fields = get_list(expr, 2LL);
+    f_len = length_list(fields);
+    f_i = 0LL;
+    while (f_i < f_len) {
+    if (cg_expr_has_var(get_list(get_list(fields, f_i), 1LL), vname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    f_i = (f_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (t == 25LL) {
+    if (cg_expr_has_var(get_list(expr, 1LL), vname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    margs = get_list(expr, 3LL);
+    m_len = length_list(margs);
+    m_i = 0LL;
+    while (m_i < m_len) {
+    if (cg_expr_has_var(get_list(margs, m_i), vname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    m_i = (m_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (t == 26LL) {
+    eargs = get_list(expr, 2LL);
+    e_len = length_list(eargs);
+    e_i = 0LL;
+    while (e_i < e_len) {
+    if (cg_expr_has_var(get_list(eargs, e_i), vname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    e_i = (e_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (t == 34LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (t == 35LL) {
+    elems = get_list(expr, 1LL);
+    l_len = length_list(elems);
+    l_i = 0LL;
+    while (l_i < l_len) {
+    if (cg_expr_has_var(get_list(elems, l_i), vname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    l_i = (l_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(14);
+    return ret_val;
+}
+
+long long cg_is_prim_expr(long long state, long long expr, long long pname) {
+    long long t = 0;
+    long long name = 0;
+    long long args = 0;
+    long long a_len = 0;
+    long long is_prim_builtin = 0;
+    long long a_i = 0;
+    long long flags = 0;
+    long long arg = 0;
+    long long fl = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&a_i);
+    ep_gc_push_root(&flags);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&pname);
+    ep_gc_maybe_collect();
+
+    if (expr == 0LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    t = get_list(expr, 0LL);
+    if ((((t == 1LL || t == 2LL) || t == 31LL) || t == 42LL)) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (t == 3LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (((t == 4LL || t == 5LL) || t == 14LL)) {
+    if (cg_is_prim_expr(state, get_list(expr, 1LL), pname) == 0LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    ret_val = cg_is_prim_expr(state, get_list(expr, 3LL), pname);
+    goto L_cleanup;
+    }
+    if (t == 32LL) {
+    ret_val = cg_is_prim_expr(state, get_list(expr, 1LL), pname);
+    goto L_cleanup;
+    }
+    if (t == 6LL) {
+    name = string_concat(get_list(expr, 1LL), (long long)"");
+    args = get_list(expr, 2LL);
+    a_len = length_list(args);
+    is_prim_builtin = 0LL;
+    if ((strcmp((char*)name, (char*)(long long)"int_to_string") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"int_to_float") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"float_to_int") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"char_from_code") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"ep_abs") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"ep_sleep_ms") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"sleep_ms") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"ep_time_ms") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if ((strcmp((char*)name, (char*)(long long)"ep_random_int") == 0)) {
+    is_prim_builtin = 1LL;
+    }
+    if (is_prim_builtin == 1LL) {
+    a_i = 0LL;
+    while (a_i < a_len) {
+    if (cg_is_prim_expr(state, get_list(args, a_i), pname) == 0LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    a_i = (a_i + 1LL);
+    }
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    flags = get_prim_param_flags(state, name);
+    if (flags != 0LL) {
+    a_i = 0LL;
+    while (a_i < a_len) {
+    arg = get_list(args, a_i);
+    if (cg_expr_has_var(arg, pname) == 1LL) {
+    fl = 0LL;
+    if (a_i < length_list(flags)) {
+    fl = get_list(flags, a_i);
+    }
+    if (fl == 0LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (cg_is_prim_expr(state, arg, pname) == 0LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    }
+    a_i = (a_i + 1LL);
+    }
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_expr_has_var(expr, pname) == 1LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_expr_has_var(expr, pname) == 1LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    ret_val = 1LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(8);
+    return ret_val;
+}
+
+long long cg_stmts_have_nonprim(long long state, long long stmts, long long pname) {
+    long long len = 0;
+    long long idx = 0;
+    long long stmt = 0;
+    long long t = 0;
+    long long eb = 0;
+    long long lv = 0;
+    long long arms = 0;
+    long long a_len = 0;
+    long long a_i = 0;
+    long long arm = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&eb);
+    ep_gc_push_root(&lv);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&a_i);
+    ep_gc_push_root(&arm);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&pname);
+    ep_gc_maybe_collect();
+
+    len = length_list(stmts);
+    idx = 0LL;
+    while (idx < len) {
+    stmt = get_list(stmts, idx);
+    t = get_list(stmt, 0LL);
+    if (t == 7LL) {
+    if (cg_is_prim_expr(state, get_list(stmt, 2LL), pname) == 0LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    }
+    if (((t == 8LL || t == 9LL) || t == 36LL)) {
+    if (cg_is_prim_expr(state, get_list(stmt, 1LL), pname) == 0LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    }
+    if (t == 10LL) {
+    if (cg_is_prim_expr(state, get_list(stmt, 1LL), pname) == 0LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_stmts_have_nonprim(state, get_list(stmt, 2LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    eb = get_list(stmt, 3LL);
+    if (eb != 0LL) {
+    if (cg_stmts_have_nonprim(state, eb, pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    }
+    }
+    if (t == 11LL) {
+    if (cg_is_prim_expr(state, get_list(stmt, 1LL), pname) == 0LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_stmts_have_nonprim(state, get_list(stmt, 2LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    }
+    if (t == 28LL) {
+    lv = string_concat(get_list(stmt, 1LL), (long long)"");
+    if ((strcmp((char*)lv, (char*)pname) == 0)) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_is_prim_expr(state, get_list(stmt, 2LL), pname) == 0LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_stmts_have_nonprim(state, get_list(stmt, 3LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    }
+    if (t == 16LL) {
+    if (cg_expr_has_var(get_list(stmt, 1LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_expr_has_var(get_list(stmt, 2LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    }
+    if (t == 23LL) {
+    if (cg_expr_has_var(get_list(stmt, 1LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_expr_has_var(get_list(stmt, 3LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    }
+    if (t == 27LL) {
+    if (cg_expr_has_var(get_list(stmt, 1LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    arms = get_list(stmt, 2LL);
+    a_len = length_list(arms);
+    a_i = 0LL;
+    while (a_i < a_len) {
+    arm = get_list(arms, a_i);
+    if (contains_string_val(get_list(arm, 1LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (cg_stmts_have_nonprim(state, get_list(arm, 2LL), pname) == 1LL) {
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    a_i = (a_i + 1LL);
+    }
+    }
+    idx = (idx + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(10);
+    return ret_val;
+}
+
+long long usage_promote_call(long long name, long long args, long long var_keys, long long var_values) {
+    long long a0 = 0;
+    long long vname = 0;
+    long long cur = 0;
+    long long n = 0;
+    long long new_t = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&a0);
+    ep_gc_push_root(&vname);
+    ep_gc_push_root(&n);
+    ep_gc_push_root(&new_t);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_maybe_collect();
+
+    if (length_list(args) == 0LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    a0 = get_list(args, 0LL);
+    if (get_list(a0, 0LL) != 3LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    vname = get_list(a0, 1LL);
+    cur = map_get(var_keys, var_values, vname);
+    if (cur != 1LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    n = string_concat(name, (long long)"");
+    new_t = 0LL;
+    if ((strcmp((char*)n, (char*)(long long)"length_list") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"append_list") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"get_list") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"set_list") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"remove_list") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"pop_list") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_insert") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_get_val") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_contains") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_delete") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_keys") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_size") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_values") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_set_str") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"map_get_str") == 0)) {
+    new_t = 4LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_length") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"get_character") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"char_at") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_contains") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_index_of") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_replace") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_upper") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_lower") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_trim") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_split") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"string_to_list") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"json_get_string") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"json_get_int") == 0)) {
+    new_t = 2LL;
+    }
+    if ((strcmp((char*)n, (char*)(long long)"json_get_bool") == 0)) {
+    new_t = 2LL;
+    }
+    if (new_t != 0LL) {
+    ok = map_put(var_keys, var_values, vname, new_t);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(8);
+    return ret_val;
+}
+
+long long infer_usage_types_expr(long long expr, long long var_keys, long long var_values) {
+    long long t = 0;
+    long long ok = 0;
+    long long args = 0;
+    long long a_len = 0;
+    long long a_i = 0;
+    long long oka = 0;
+    long long okl = 0;
+    long long okr = 0;
+    long long fields = 0;
+    long long f_len = 0;
+    long long f_i = 0;
+    long long okf = 0;
+    long long oko = 0;
+    long long margs = 0;
+    long long m_len = 0;
+    long long m_i = 0;
+    long long okm = 0;
+    long long eargs = 0;
+    long long e_len = 0;
+    long long e_i = 0;
+    long long oke = 0;
+    long long elems = 0;
+    long long l_len = 0;
+    long long l_i = 0;
+    long long okl2 = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&a_i);
+    ep_gc_push_root(&fields);
+    ep_gc_push_root(&f_i);
+    ep_gc_push_root(&margs);
+    ep_gc_push_root(&m_i);
+    ep_gc_push_root(&eargs);
+    ep_gc_push_root(&e_i);
+    ep_gc_push_root(&elems);
+    ep_gc_push_root(&l_i);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_maybe_collect();
+
+    if (expr == 0LL) {
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    t = get_list(expr, 0LL);
+    if (t == 6LL) {
+    ok = usage_promote_call(get_list(expr, 1LL), get_list(expr, 2LL), var_keys, var_values);
+    args = get_list(expr, 2LL);
+    a_len = length_list(args);
+    a_i = 0LL;
+    while (a_i < a_len) {
+    oka = infer_usage_types_expr(get_list(args, a_i), var_keys, var_values);
+    a_i = (a_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (((t == 4LL || t == 5LL) || t == 14LL)) {
+    okl = infer_usage_types_expr(get_list(expr, 1LL), var_keys, var_values);
+    okr = infer_usage_types_expr(get_list(expr, 3LL), var_keys, var_values);
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (((((t == 18LL || t == 20LL) || t == 21LL) || t == 32LL) || t == 33LL)) {
+    ret_val = infer_usage_types_expr(get_list(expr, 1LL), var_keys, var_values);
+    goto L_cleanup;
+    }
+    if (t == 24LL) {
+    fields = get_list(expr, 2LL);
+    f_len = length_list(fields);
+    f_i = 0LL;
+    while (f_i < f_len) {
+    okf = infer_usage_types_expr(get_list(get_list(fields, f_i), 1LL), var_keys, var_values);
+    f_i = (f_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (t == 25LL) {
+    oko = infer_usage_types_expr(get_list(expr, 1LL), var_keys, var_values);
+    margs = get_list(expr, 3LL);
+    m_len = length_list(margs);
+    m_i = 0LL;
+    while (m_i < m_len) {
+    okm = infer_usage_types_expr(get_list(margs, m_i), var_keys, var_values);
+    m_i = (m_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (t == 26LL) {
+    eargs = get_list(expr, 2LL);
+    e_len = length_list(eargs);
+    e_i = 0LL;
+    while (e_i < e_len) {
+    oke = infer_usage_types_expr(get_list(eargs, e_i), var_keys, var_values);
+    e_i = (e_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    if (t == 35LL) {
+    elems = get_list(expr, 1LL);
+    l_len = length_list(elems);
+    l_i = 0LL;
+    while (l_i < l_len) {
+    okl2 = infer_usage_types_expr(get_list(elems, l_i), var_keys, var_values);
+    l_i = (l_i + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(13);
+    return ret_val;
+}
+
+long long infer_usage_types_stmts(long long stmts, long long var_keys, long long var_values) {
+    long long len = 0;
+    long long idx = 0;
+    long long stmt = 0;
+    long long t = 0;
+    long long ok7 = 0;
+    long long ok8 = 0;
+    long long okc = 0;
+    long long okt = 0;
+    long long eb = 0;
+    long long oke = 0;
+    long long okw = 0;
+    long long okb = 0;
+    long long okn1 = 0;
+    long long okn2 = 0;
+    long long okf1 = 0;
+    long long okf2 = 0;
+    long long okm1 = 0;
+    long long arms = 0;
+    long long ar_len = 0;
+    long long ar_i = 0;
+    long long okab = 0;
+    long long okfe1 = 0;
+    long long okfe2 = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&eb);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&ar_i);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_maybe_collect();
+
+    len = length_list(stmts);
+    idx = 0LL;
+    while (idx < len) {
+    stmt = get_list(stmts, idx);
+    t = get_list(stmt, 0LL);
+    if (t == 7LL) {
+    ok7 = infer_usage_types_expr(get_list(stmt, 2LL), var_keys, var_values);
+    }
+    if (((t == 8LL || t == 9LL) || t == 36LL)) {
+    ok8 = infer_usage_types_expr(get_list(stmt, 1LL), var_keys, var_values);
+    }
+    if (t == 10LL) {
+    okc = infer_usage_types_expr(get_list(stmt, 1LL), var_keys, var_values);
+    okt = infer_usage_types_stmts(get_list(stmt, 2LL), var_keys, var_values);
+    eb = get_list(stmt, 3LL);
+    if (eb != 0LL) {
+    oke = infer_usage_types_stmts(eb, var_keys, var_values);
+    }
+    }
+    if (t == 11LL) {
+    okw = infer_usage_types_expr(get_list(stmt, 1LL), var_keys, var_values);
+    okb = infer_usage_types_stmts(get_list(stmt, 2LL), var_keys, var_values);
+    }
+    if (t == 16LL) {
+    okn1 = infer_usage_types_expr(get_list(stmt, 1LL), var_keys, var_values);
+    okn2 = infer_usage_types_expr(get_list(stmt, 2LL), var_keys, var_values);
+    }
+    if (t == 23LL) {
+    okf1 = infer_usage_types_expr(get_list(stmt, 1LL), var_keys, var_values);
+    okf2 = infer_usage_types_expr(get_list(stmt, 3LL), var_keys, var_values);
+    }
+    if (t == 27LL) {
+    okm1 = infer_usage_types_expr(get_list(stmt, 1LL), var_keys, var_values);
+    arms = get_list(stmt, 2LL);
+    ar_len = length_list(arms);
+    ar_i = 0LL;
+    while (ar_i < ar_len) {
+    okab = infer_usage_types_stmts(get_list(get_list(arms, ar_i), 2LL), var_keys, var_values);
+    ar_i = (ar_i + 1LL);
+    }
+    }
+    if (t == 28LL) {
+    okfe1 = infer_usage_types_expr(get_list(stmt, 2LL), var_keys, var_values);
+    okfe2 = infer_usage_types_stmts(get_list(stmt, 3LL), var_keys, var_values);
+    }
+    idx = (idx + 1LL);
+    }
+    ret_val = 0LL;
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(8);
     return ret_val;
 }
 
@@ -11394,6 +13137,10 @@ long long is_builtin_c_func(long long state, long long name) {
     long long ret_val = 0;
 
     ep_gc_push_root(&name_str);
+    ep_gc_push_root(&keys);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&name);
     ep_gc_maybe_collect();
 
     name_str = string_concat(name, (long long)"");
@@ -11410,95 +13157,115 @@ long long is_builtin_c_func(long long state, long long name) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
 long long get_codegen_borrowed_keys(long long state) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ret_val = get_list(state, 8LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long set_codegen_borrowed_keys(long long state, long long keys) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&keys);
     ep_gc_maybe_collect();
 
     ret_val = set_list(state, 8LL, keys);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
 long long get_codegen_borrowed_values(long long state) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ret_val = get_list(state, 9LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long set_codegen_borrowed_values(long long state, long long values) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&values);
     ep_gc_maybe_collect();
 
     ret_val = set_list(state, 9LL, values);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
 long long get_codegen_spawn_list(long long state) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ret_val = get_list(state, 6LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long set_codegen_spawn_list(long long state, long long spawn_list) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&spawn_list);
     ep_gc_maybe_collect();
 
     ret_val = set_list(state, 6LL, spawn_list);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
 long long get_codegen_spawn_index(long long state) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
     ep_gc_maybe_collect();
 
     ret_val = get_list(state, 7LL);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
 long long set_codegen_spawn_index(long long state, long long spawn_index) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&spawn_index);
     ep_gc_maybe_collect();
 
     ret_val = set_list(state, 7LL, spawn_index);
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -11507,6 +13274,9 @@ long long emit(long long state, long long line) {
     long long ok = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&lines);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&line);
     ep_gc_maybe_collect();
 
     lines = get_list(state, 0LL);
@@ -11514,6 +13284,7 @@ long long emit(long long state, long long line) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -11527,6 +13298,10 @@ long long add_string_literal(long long state, long long s) {
     long long ret_val = 0;
 
     ep_gc_push_root(&s_str);
+    ep_gc_push_root(&lits);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&s);
     ep_gc_maybe_collect();
 
     s_str = string_concat(s, (long long)"");
@@ -11545,7 +13320,7 @@ long long add_string_literal(long long state, long long s) {
     ret_val = len;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -11559,9 +13334,14 @@ long long get_new_label(long long state, long long prefix) {
     long long final_label = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&count);
+    ep_gc_push_root(&next_count);
+    ep_gc_push_root(&num_str);
     ep_gc_push_root(&label_half);
     ep_gc_push_root(&label);
     ep_gc_push_root(&final_label);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&prefix);
     ep_gc_maybe_collect();
 
     count = get_list(state, 2LL);
@@ -11574,7 +13354,7 @@ long long get_new_label(long long state, long long prefix) {
     ret_val = final_label;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(3);
+    ep_gc_pop_roots(8);
     return ret_val;
 }
 
@@ -11597,15 +13377,25 @@ long long analyze_return_types(long long state, long long program) {
     long long body = 0;
     long long var_keys = 0;
     long long var_values = 0;
-    long long p_len = 0;
-    long long p_idx = 0;
-    long long p_node = 0;
-    long long p_name = 0;
-    long long is_borrow = 0;
-    long long param_type = 0;
     long long ret_t = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&keys);
+    ep_gc_push_root(&values);
+    ep_gc_push_root(&externals);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&ext_node);
+    ep_gc_push_root(&ext_name);
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_push_root(&ret_t);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&program);
     ep_gc_maybe_collect();
 
     keys = get_list(state, 3LL);
@@ -11758,19 +13548,7 @@ long long analyze_return_types(long long state, long long program) {
     body = get_list(func, 3LL);
     var_keys = (create_list() + 0LL);
     var_values = (create_list() + 0LL);
-    p_len = length_list(params);
-    p_idx = 0LL;
-    while (p_idx < p_len) {
-    p_node = get_list(params, p_idx);
-    p_name = get_list(p_node, 0LL);
-    is_borrow = get_list(p_node, 1LL);
-    param_type = 1LL;
-    if (is_borrow == 1LL) {
-    param_type = 5LL;
-    }
-    ok = map_put(var_keys, var_values, p_name, param_type);
-    p_idx = (p_idx + 1LL);
-    }
+    ok = seed_param_types(params, var_keys, var_values);
     ok = collect_var_types(state, body, var_keys, var_values);
     ret_t = determine_ret_type(state, body, var_keys, var_values);
     if (ret_t == 0LL) {
@@ -11784,6 +13562,7 @@ long long analyze_return_types(long long state, long long program) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(16);
     return ret_val;
 }
 
@@ -11807,6 +13586,23 @@ long long collect_var_types(long long state, long long stmts, long long var_keys
     long long fe_body = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&t);
+    ep_gc_push_root(&then_b);
+    ep_gc_push_root(&else_b);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&a_idx);
+    ep_gc_push_root(&arm);
+    ep_gc_push_root(&arm_body);
+    ep_gc_push_root(&fe_body);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
     ep_gc_maybe_collect();
 
     len = length_list(stmts);
@@ -11861,6 +13657,7 @@ long long collect_var_types(long long state, long long stmts, long long var_keys
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(17);
     return ret_val;
 }
 
@@ -11877,6 +13674,16 @@ long long determine_ret_type(long long state, long long stmts, long long var_key
     long long body = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&then_b);
+    ep_gc_push_root(&else_b);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
     ep_gc_maybe_collect();
 
     len = length_list(stmts);
@@ -11920,6 +13727,7 @@ long long determine_ret_type(long long state, long long stmts, long long var_key
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(10);
     return ret_val;
 }
 
@@ -11934,6 +13742,14 @@ long long infer_type(long long state, long long expr, long long var_keys, long l
     long long inner = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&func_keys);
+    ep_gc_push_root(&func_values);
+    ep_gc_push_root(&inner);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
     ep_gc_maybe_collect();
 
     type = get_list(expr, 0LL);
@@ -12011,6 +13827,7 @@ long long infer_type(long long state, long long expr, long long var_keys, long l
     ret_val = 1LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(8);
     return ret_val;
 }
 
@@ -12021,6 +13838,8 @@ long long is_global_var(long long name) {
     long long ch = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&name);
     ep_gc_maybe_collect();
 
     len = string_length((char*)name);
@@ -12044,6 +13863,7 @@ long long is_global_var(long long name) {
     ret_val = has_upper;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(2);
     return ret_val;
 }
 
@@ -12058,6 +13878,10 @@ long long cg_string_contains(long long s, long long sub) {
     long long c2 = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&j);
+    ep_gc_push_root(&s);
+    ep_gc_push_root(&sub);
     ep_gc_maybe_collect();
 
     len = string_length((char*)s);
@@ -12092,6 +13916,7 @@ long long cg_string_contains(long long s, long long sub) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -12101,6 +13926,9 @@ long long str_starts_with(long long s, long long prefix) {
     long long i = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&s);
+    ep_gc_push_root(&prefix);
     ep_gc_maybe_collect();
 
     slen = string_length((char*)s);
@@ -12120,6 +13948,7 @@ long long str_starts_with(long long s, long long prefix) {
     ret_val = 1LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(3);
     return ret_val;
 }
 
@@ -12130,6 +13959,10 @@ long long str_ends_with(long long s, long long suffix) {
     long long i = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&off);
+    ep_gc_push_root(&i);
+    ep_gc_push_root(&s);
+    ep_gc_push_root(&suffix);
     ep_gc_maybe_collect();
 
     slen = string_length((char*)s);
@@ -12150,12 +13983,14 @@ long long str_ends_with(long long s, long long suffix) {
     ret_val = 1LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
 long long is_accessor_name(long long name) {
     long long ret_val = 0;
 
+    ep_gc_push_root(&name);
     ep_gc_maybe_collect();
 
     if ((strcmp((char*)(long long)"get", (char*)name) == 0)) {
@@ -12185,6 +14020,7 @@ long long is_accessor_name(long long name) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(1);
     return ret_val;
 }
 
@@ -12195,6 +14031,11 @@ long long is_borrow_expr(long long expr, long long borrowed_keys, long long borr
     long long is_borrowed = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&func_name);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&borrowed_keys);
+    ep_gc_push_root(&borrowed_values);
     ep_gc_maybe_collect();
 
     type = get_list(expr, 0LL);
@@ -12220,6 +14061,7 @@ long long is_borrow_expr(long long expr, long long borrowed_keys, long long borr
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(5);
     return ret_val;
 }
 
@@ -12237,6 +14079,16 @@ long long scan_stmts_for_borrows(long long stmts, long long borrowed_keys, long 
     long long body = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&then_b);
+    ep_gc_push_root(&else_b);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&borrowed_keys);
+    ep_gc_push_root(&borrowed_values);
     ep_gc_maybe_collect();
 
     len = length_list(stmts);
@@ -12271,6 +14123,7 @@ long long scan_stmts_for_borrows(long long stmts, long long borrowed_keys, long 
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(10);
     return ret_val;
 }
 
@@ -12282,6 +14135,13 @@ long long collect_borrowed_vars(long long stmts, long long params, long long bor
     long long ok = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&p_name);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&borrowed_keys);
+    ep_gc_push_root(&borrowed_values);
     ep_gc_maybe_collect();
 
     p_len = length_list(params);
@@ -12296,6 +14156,7 @@ long long collect_borrowed_vars(long long stmts, long long params, long long bor
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(7);
     return ret_val;
 }
 
@@ -12312,7 +14173,14 @@ long long var_returned_in_stmts(long long name, long long stmts) {
     long long ai = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
     ep_gc_push_root(&ids);
+    ep_gc_push_root(&eb);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&ai);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&stmts);
     ep_gc_maybe_collect();
 
     n = length_list(stmts);
@@ -12370,7 +14238,7 @@ long long var_returned_in_stmts(long long name, long long stmts) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(8);
     return ret_val;
 }
 
@@ -12386,11 +14254,6 @@ long long gen_function(long long state, long long func) {
     long long var_types_keys = 0;
     long long var_types_values = 0;
     long long p_len = 0;
-    long long p_idx = 0;
-    long long p_node = 0;
-    long long p_name = 0;
-    long long is_borrow = 0;
-    long long param_type = 0;
     long long cname = 0;
     long long aw_count = 0;
     long long async_locals = 0;
@@ -12409,6 +14272,9 @@ long long gen_function(long long state, long long func) {
     long long pnm = 0;
     long long impl_name = 0;
     long long header = 0;
+    long long p_idx = 0;
+    long long p_node = 0;
+    long long p_name = 0;
     long long borrowed_keys = 0;
     long long borrowed_values = 0;
     long long num_vars = 0;
@@ -12421,6 +14287,7 @@ long long gen_function(long long state, long long func) {
     long long gc_root_count = 0;
     long long is_p = 0;
     long long t = 0;
+    long long should_root = 0;
     long long root_line = 0;
     long long body_len = 0;
     long long stmt = 0;
@@ -12428,14 +14295,46 @@ long long gen_function(long long state, long long func) {
     long long root_pop = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&func_keys);
+    ep_gc_push_root(&func_values);
+    ep_gc_push_root(&ret_t);
+    ep_gc_push_root(&var_types_keys);
+    ep_gc_push_root(&var_types_values);
+    ep_gc_push_root(&cname);
     ep_gc_push_root(&async_locals);
+    ep_gc_push_root(&al_i);
     ep_gc_push_root(&sd);
+    ep_gc_push_root(&vi);
+    ep_gc_push_root(&awi);
     ep_gc_push_root(&sf);
+    ep_gc_push_root(&bs_i);
+    ep_gc_push_root(&bstmt);
+    ep_gc_push_root(&saved_ctr);
+    ep_gc_push_root(&post_ctr);
     ep_gc_push_root(&pf);
+    ep_gc_push_root(&pj);
+    ep_gc_push_root(&pnm);
+    ep_gc_push_root(&impl_name);
     ep_gc_push_root(&header);
+    ep_gc_push_root(&p_idx);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&p_name);
+    ep_gc_push_root(&borrowed_keys);
+    ep_gc_push_root(&borrowed_values);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&p_i);
     ep_gc_push_root(&decl);
+    ep_gc_push_root(&gc_root_count);
     ep_gc_push_root(&root_line);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&gc_count_str);
     ep_gc_push_root(&root_pop);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&func);
     ep_gc_maybe_collect();
 
     name = get_list(func, 1LL);
@@ -12452,19 +14351,9 @@ long long gen_function(long long state, long long func) {
     var_types_keys = (create_list() + 0LL);
     var_types_values = (create_list() + 0LL);
     p_len = length_list(params);
-    p_idx = 0LL;
-    while (p_idx < p_len) {
-    p_node = get_list(params, p_idx);
-    p_name = get_list(p_node, 0LL);
-    is_borrow = get_list(p_node, 1LL);
-    param_type = 1LL;
-    if (is_borrow == 1LL) {
-    param_type = 5LL;
-    }
-    ok = map_put(var_types_keys, var_types_values, p_name, param_type);
-    p_idx = (p_idx + 1LL);
-    }
+    ok = seed_param_types(params, var_types_keys, var_types_values);
     ok = collect_var_types(state, body, var_types_keys, var_types_values);
+    ok = infer_usage_types_stmts(body, var_types_keys, var_types_values);
     if (is_async == 1LL) {
     cname = get_fn_c_name(func);
     aw_count = count_awaits_stmts(body);
@@ -12539,7 +14428,7 @@ long long gen_function(long long state, long long func) {
     pf = string_concat(pf, (long long)") {\n");
     pf = string_concat(pf, (long long)"    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));\n");
     pf = string_concat(pf, (long long)"    fut->completed = 0; fut->value = 0; fut->waiting_task = NULL; fut->chan = 0;\n");
-    pf = string_concat(pf, (long long)"    ep_gc_register(fut, EP_OBJ_STRUCT);\n");
+    pf = string_concat(pf, (long long)"    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }\n");
     pf = string_concat(pf, (long long)"    ");
     pf = string_concat(pf, cname);
     pf = string_concat(pf, (long long)"_async_args* args = (");
@@ -12635,7 +14524,11 @@ long long gen_function(long long state, long long func) {
     is_global = is_global_var(var_name);
     if (is_global == 0LL) {
     t = map_get(var_types_keys, var_types_values, var_name);
-    if ((t == 3LL || t == 4LL)) {
+    should_root = 1LL;
+    if (((t == 1LL || t == 7LL) || t == 8LL)) {
+    should_root = cg_stmts_have_nonprim(state, body, string_concat(var_name, (long long)""));
+    }
+    if (should_root == 1LL) {
     root_line = (long long)"    ep_gc_push_root(&";
     root_line = string_concat(root_line, var_name);
     root_line = string_concat(root_line, (long long)");\n");
@@ -12645,6 +14538,24 @@ long long gen_function(long long state, long long func) {
     }
     }
     idx = (idx + 1LL);
+    }
+    p_i = 0LL;
+    while (p_i < p_len) {
+    p_node = get_list(params, p_i);
+    p_name = get_list(p_node, 0LL);
+    t = map_get(var_types_keys, var_types_values, p_name);
+    should_root = 1LL;
+    if (((t == 1LL || t == 7LL) || t == 8LL)) {
+    should_root = cg_stmts_have_nonprim(state, body, string_concat(p_name, (long long)""));
+    }
+    if (should_root == 1LL) {
+    root_line = (long long)"    ep_gc_push_root(&";
+    root_line = string_concat(root_line, p_name);
+    root_line = string_concat(root_line, (long long)");\n");
+    ok = emit(state, root_line);
+    gc_root_count = (gc_root_count + 1LL);
+    }
+    p_i = (p_i + 1LL);
     }
     ok = emit(state, (long long)"    ep_gc_maybe_collect();\n\n");
     body_len = length_list(body);
@@ -12681,7 +14592,7 @@ long long gen_function(long long state, long long func) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(8);
+    ep_gc_pop_roots(40);
     return ret_val;
 }
 
@@ -12755,21 +14666,60 @@ long long gen_statement(long long state, long long stmt, long long var_keys, lon
     long long ib_i = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&expr);
     ep_gc_push_root(&expr_str);
     ep_gc_push_root(&al);
     ep_gc_push_root(&line);
     ep_gc_push_root(&arl);
     ep_gc_push_root(&null_line);
     ep_gc_push_root(&callee);
+    ep_gc_push_root(&cond);
+    ep_gc_push_root(&then_b);
+    ep_gc_push_root(&else_b);
     ep_gc_push_root(&cond_str);
+    ep_gc_push_root(&t_idx);
+    ep_gc_push_root(&s);
+    ep_gc_push_root(&e_idx);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&b_idx);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&idx_val);
+    ep_gc_push_root(&j);
+    ep_gc_push_root(&arg);
     ep_gc_push_root(&arg_str);
+    ep_gc_push_root(&chan);
+    ep_gc_push_root(&val);
     ep_gc_push_root(&chan_str);
     ep_gc_push_root(&val_str);
+    ep_gc_push_root(&obj);
+    ep_gc_push_root(&field_name);
     ep_gc_push_root(&obj_str);
+    ep_gc_push_root(&arms);
+    ep_gc_push_root(&arm_idx);
+    ep_gc_push_root(&arm);
+    ep_gc_push_root(&vname);
+    ep_gc_push_root(&bindings);
+    ep_gc_push_root(&arm_body);
+    ep_gc_push_root(&kw);
+    ep_gc_push_root(&vp_codes);
+    ep_gc_push_root(&vpk);
+    ep_gc_push_root(&vpv);
+    ep_gc_push_root(&vpk_i);
+    ep_gc_push_root(&bname);
+    ep_gc_push_root(&bcode);
+    ep_gc_push_root(&ab_idx);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&iter_expr);
     ep_gc_push_root(&iter_str);
     ep_gc_push_root(&label);
     ep_gc_push_root(&il);
     ep_gc_push_root(&bl);
+    ep_gc_push_root(&ib_i);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
     ep_gc_maybe_collect();
 
     type = get_list(stmt, 0LL);
@@ -12875,9 +14825,9 @@ long long gen_statement(long long state, long long stmt, long long var_keys, lon
     line = string_concat(line, (long long)") ? \"true\" : \"false\");\n");
     ok = emit(state, line);
     } else {
-    line = (long long)"    printf(\"%lld\\n\", ";
+    line = (long long)"    printf(\"%s\\n\", (char*)ep_auto_to_string(";
     line = string_concat(line, expr_str);
-    line = string_concat(line, (long long)");\n");
+    line = string_concat(line, (long long)"));\n");
     ok = emit(state, line);
     }
     }
@@ -13002,13 +14952,13 @@ long long gen_statement(long long state, long long stmt, long long var_keys, lon
     val = get_list(stmt, 3LL);
     obj_str = gen_expr(state, obj, var_keys, var_values);
     val_str = gen_expr(state, val, var_keys, var_values);
-    line = (long long)"    ((long long*)";
+    line = (long long)"    { long long* _ep_fo = (long long*)(";
     line = string_concat(line, obj_str);
-    line = string_concat(line, (long long)")[EP_FIELD_");
-    line = string_concat(line, field_name);
-    line = string_concat(line, (long long)"] = ");
+    line = string_concat(line, (long long)"); long long _ep_fv = ");
     line = string_concat(line, val_str);
-    line = string_concat(line, (long long)";\n");
+    line = string_concat(line, (long long)"; _ep_fo[EP_FIELD_");
+    line = string_concat(line, field_name);
+    line = string_concat(line, (long long)"] = _ep_fv; ep_gc_write_barrier((void*)_ep_fo, _ep_fv); }\n");
     ok = emit(state, line);
     ret_val = 0LL;
     goto L_cleanup;
@@ -13179,7 +15129,7 @@ long long gen_statement(long long state, long long stmt, long long var_keys, lon
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(15);
+    ep_gc_pop_roots(54);
     return ret_val;
 }
 
@@ -13317,45 +15267,104 @@ long long gen_expr(long long state, long long expr, long long var_keys, long lon
     long long elem_str = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&val);
+    ep_gc_push_root(&num_str);
     ep_gc_push_root(&fres);
     ep_gc_push_root(&escaped);
     ep_gc_push_root(&res);
+    ep_gc_push_root(&name);
     ep_gc_push_root(&eres);
+    ep_gc_push_root(&fk);
+    ep_gc_push_root(&left);
+    ep_gc_push_root(&right);
     ep_gc_push_root(&left_str);
     ep_gc_push_root(&right_str);
+    ep_gc_push_root(&fop);
     ep_gc_push_root(&lu);
     ep_gc_push_root(&ru);
     ep_gc_push_root(&fr2);
+    ep_gc_push_root(&op_str);
+    ep_gc_push_root(&cmp_op);
+    ep_gc_push_root(&args);
     ep_gc_push_root(&fexpr);
     ep_gc_push_root(&formatted_args);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&arg);
     ep_gc_push_root(&arg_val);
     ep_gc_push_root(&casted);
     ep_gc_push_root(&args_str_list);
+    ep_gc_push_root(&arg_item);
     ep_gc_push_root(&args_joined);
+    ep_gc_push_root(&func_keys);
     ep_gc_push_root(&cl_sig);
     ep_gc_push_root(&rw_sig);
     ep_gc_push_root(&call_str);
+    ep_gc_push_root(&chan);
     ep_gc_push_root(&chan_str);
+    ep_gc_push_root(&inner);
+    ep_gc_push_root(&awn);
+    ep_gc_push_root(&awns);
     ep_gc_push_root(&inner_str);
+    ep_gc_push_root(&obj);
+    ep_gc_push_root(&field_name);
     ep_gc_push_root(&obj_str);
+    ep_gc_push_root(&fields);
+    ep_gc_push_root(&f_idx);
+    ep_gc_push_root(&fpair);
+    ep_gc_push_root(&fname);
+    ep_gc_push_root(&fval);
     ep_gc_push_root(&fval_str);
     ep_gc_push_root(&arg_str);
+    ep_gc_push_root(&variant_name);
+    ep_gc_push_root(&alloc_size);
+    ep_gc_push_root(&a_idx);
+    ep_gc_push_root(&ok_variant);
+    ep_gc_push_root(&fkeys);
+    ep_gc_push_root(&fvals);
+    ep_gc_push_root(&callee);
+    ep_gc_push_root(&fi);
+    ep_gc_push_root(&tid);
     ep_gc_push_root(&tv);
     ep_gc_push_root(&r);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&cidx);
     ep_gc_push_root(&cname);
     ep_gc_push_root(&raw_names);
     ep_gc_push_root(&captured);
+    ep_gc_push_root(&rn_i);
     ep_gc_push_root(&nm);
+    ep_gc_push_root(&pp_i);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&n_caps);
+    ep_gc_push_root(&saved_lines);
+    ep_gc_push_root(&fresh);
     ep_gc_push_root(&hdr);
+    ep_gc_push_root(&hp_i);
+    ep_gc_push_root(&cp_i);
     ep_gc_push_root(&unp);
     ep_gc_push_root(&c_keys);
     ep_gc_push_root(&c_values);
+    ep_gc_push_root(&ov_i);
+    ep_gc_push_root(&pv_i);
     ep_gc_push_root(&b_keys);
     ep_gc_push_root(&b_values);
+    ep_gc_push_root(&bv_i);
     ep_gc_push_root(&bname);
+    ep_gc_push_root(&bp_i);
     ep_gc_push_root(&dec);
+    ep_gc_push_root(&bs_i);
     ep_gc_push_root(&closure_text);
+    ep_gc_push_root(&cbodies);
+    ep_gc_push_root(&ce_i);
+    ep_gc_push_root(&elements);
+    ep_gc_push_root(&e_idx);
+    ep_gc_push_root(&elem);
     ep_gc_push_root(&elem_str);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
     ep_gc_maybe_collect();
 
     type = get_list(expr, 0LL);
@@ -13745,7 +15754,7 @@ long long gen_expr(long long state, long long expr, long long var_keys, long lon
     struct_name = get_list(expr, 1LL);
     fields = get_list(expr, 2LL);
     field_count = length_list(fields);
-    res = (long long)"({ long long* _s = (long long*)malloc(sizeof(long long) * EP_STRUCT_MAX_SLOTS); ";
+    res = (long long)"({ long long* _s = (long long*)calloc(EP_STRUCT_MAX_SLOTS, sizeof(long long)); ";
     f_idx = 0LL;
     while (f_idx < field_count) {
     fpair = get_list(fields, f_idx);
@@ -13759,7 +15768,7 @@ long long gen_expr(long long state, long long expr, long long var_keys, long lon
     res = string_concat(res, (long long)"; ");
     f_idx = (f_idx + 1LL);
     }
-    res = string_concat(res, (long long)"ep_gc_register(_s, EP_OBJ_STRUCT); (long long)_s; })");
+    res = string_concat(res, (long long)"{ EpGCObject* _go = ep_gc_register(_s, EP_OBJ_STRUCT); if(_go) _go->num_fields = EP_STRUCT_MAX_SLOTS; } (long long)_s; })");
     ret_val = res;
     goto L_cleanup;
     }
@@ -14046,7 +16055,7 @@ long long gen_expr(long long state, long long expr, long long var_keys, long lon
     ret_val = (long long)"";
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(39);
+    ep_gc_pop_roots(98);
     return ret_val;
 }
 
@@ -14102,9 +16111,17 @@ long long get_c_test_main_source(long long program) {
     long long tc_name = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&funcs);
     ep_gc_push_root(&test_cases);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&name);
     ep_gc_push_root(&prefix);
+    ep_gc_push_root(&test_count);
     ep_gc_push_root(&lines);
+    ep_gc_push_root(&idx2);
+    ep_gc_push_root(&tc_name);
+    ep_gc_push_root(&program);
     ep_gc_maybe_collect();
 
     funcs = get_list(program, 3LL);
@@ -14189,7 +16206,7 @@ long long get_c_test_main_source(long long program) {
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(3);
+    ep_gc_pop_roots(11);
     return ret_val;
 }
 
@@ -14204,6 +16221,13 @@ long long collect_spawns_in_stmts(long long stmts, long long spawn_list) {
     long long body = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&then_b);
+    ep_gc_push_root(&else_b);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&spawn_list);
     ep_gc_maybe_collect();
 
     len = length_list(stmts);
@@ -14233,6 +16257,7 @@ long long collect_spawns_in_stmts(long long stmts, long long spawn_list) {
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(7);
     return ret_val;
 }
 
@@ -14247,6 +16272,11 @@ long long collect_all_spawns(long long program) {
     long long ret_val = 0;
 
     ep_gc_push_root(&spawn_list);
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&program);
     ep_gc_maybe_collect();
 
     spawn_list = create_list();
@@ -14263,7 +16293,7 @@ long long collect_all_spawns(long long program) {
     spawn_list = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(6);
     return ret_val;
 }
 
@@ -14276,6 +16306,9 @@ long long clone_list(long long lst) {
     long long ret_val = 0;
 
     ep_gc_push_root(&new_lst);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&item);
+    ep_gc_push_root(&lst);
     ep_gc_maybe_collect();
 
     new_lst = create_list();
@@ -14290,7 +16323,7 @@ long long clone_list(long long lst) {
     new_lst = 0;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(1);
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -14311,6 +16344,19 @@ long long check_expr_reads(long long expr, long long var_keys, long long var_val
     long long chan = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&inner);
+    ep_gc_push_root(&left);
+    ep_gc_push_root(&right);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&chan);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_push_root(&state_keys);
+    ep_gc_push_root(&state_values);
     ep_gc_maybe_collect();
 
     type = get_list(expr, 0LL);
@@ -14388,6 +16434,7 @@ long long check_expr_reads(long long expr, long long var_keys, long long var_val
     ret_val = 1LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(13);
     return ret_val;
 }
 
@@ -14396,6 +16443,10 @@ long long dec_borrow_count(long long target, long long count_keys, long long cou
     long long ok = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&val);
+    ep_gc_push_root(&target);
+    ep_gc_push_root(&count_keys);
+    ep_gc_push_root(&count_values);
     ep_gc_maybe_collect();
 
     val = map_get(count_keys, count_values, target);
@@ -14407,6 +16458,7 @@ long long dec_borrow_count(long long target, long long count_keys, long long cou
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -14415,6 +16467,10 @@ long long inc_borrow_count(long long target, long long count_keys, long long cou
     long long ok = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&val);
+    ep_gc_push_root(&target);
+    ep_gc_push_root(&count_keys);
+    ep_gc_push_root(&count_values);
     ep_gc_maybe_collect();
 
     val = map_get(count_keys, count_values, target);
@@ -14422,6 +16478,7 @@ long long inc_borrow_count(long long target, long long count_keys, long long cou
     ret_val = 0LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(4);
     return ret_val;
 }
 
@@ -14498,6 +16555,26 @@ long long check_safety_stmts(long long func, long long stmts, long long var_keys
     long long end_val = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&stmt);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&expr);
+    ep_gc_push_root(&old_target);
+    ep_gc_push_root(&inner);
+    ep_gc_push_root(&target);
+    ep_gc_push_root(&src);
+    ep_gc_push_root(&chan);
+    ep_gc_push_root(&val);
+    ep_gc_push_root(&args);
+    ep_gc_push_root(&a_idx);
+    ep_gc_push_root(&arg);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&p_idx);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&p_name);
+    ep_gc_push_root(&cond);
+    ep_gc_push_root(&then_b);
+    ep_gc_push_root(&else_b);
     ep_gc_push_root(&then_state_keys);
     ep_gc_push_root(&then_state_values);
     ep_gc_push_root(&then_borrow_keys);
@@ -14510,8 +16587,27 @@ long long check_safety_stmts(long long func, long long stmts, long long var_keys
     ep_gc_push_root(&else_borrow_values);
     ep_gc_push_root(&else_count_keys);
     ep_gc_push_root(&else_count_values);
+    ep_gc_push_root(&st_idx);
+    ep_gc_push_root(&var_name);
+    ep_gc_push_root(&b_idx);
+    ep_gc_push_root(&b_k);
+    ep_gc_push_root(&b_v);
+    ep_gc_push_root(&bc_idx);
+    ep_gc_push_root(&bc_k);
+    ep_gc_push_root(&bc_v);
+    ep_gc_push_root(&body);
     ep_gc_push_root(&start_state_keys);
     ep_gc_push_root(&start_state_values);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&stmts);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_push_root(&state_keys);
+    ep_gc_push_root(&state_values);
+    ep_gc_push_root(&borrow_keys);
+    ep_gc_push_root(&borrow_values);
+    ep_gc_push_root(&count_keys);
+    ep_gc_push_root(&count_values);
     ep_gc_maybe_collect();
 
     len = length_list(stmts);
@@ -14893,7 +16989,7 @@ long long check_safety_stmts(long long func, long long stmts, long long var_keys
     ret_val = 1LL;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(14);
+    ep_gc_pop_roots(53);
     return ret_val;
 }
 
@@ -14923,6 +17019,25 @@ long long analyze_safety(long long state, long long program) {
     long long count_values = 0;
     long long ret_val = 0;
 
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&func);
+    ep_gc_push_root(&params);
+    ep_gc_push_root(&body);
+    ep_gc_push_root(&var_keys);
+    ep_gc_push_root(&var_values);
+    ep_gc_push_root(&p_idx);
+    ep_gc_push_root(&p_node);
+    ep_gc_push_root(&p_name);
+    ep_gc_push_root(&param_type);
+    ep_gc_push_root(&state_keys);
+    ep_gc_push_root(&state_values);
+    ep_gc_push_root(&borrow_keys);
+    ep_gc_push_root(&borrow_values);
+    ep_gc_push_root(&count_keys);
+    ep_gc_push_root(&count_values);
+    ep_gc_push_root(&state);
+    ep_gc_push_root(&program);
     ep_gc_maybe_collect();
 
     funcs = get_list(program, 3LL);
@@ -14975,6 +17090,7 @@ long long analyze_safety(long long state, long long program) {
     ret_val = 1LL;
     goto L_cleanup;
 L_cleanup:
+    ep_gc_pop_roots(19);
     return ret_val;
 }
 
@@ -15120,30 +17236,114 @@ long long generate_c(long long program, long long is_test_mode) {
     long long ret_val = 0;
 
     ep_gc_push_root(&state);
+    ep_gc_push_root(&it_impls);
+    ep_gc_push_root(&it_i);
+    ep_gc_push_root(&it_impl);
     ep_gc_push_root(&field_slots);
+    ep_gc_push_root(&struct_defs);
+    ep_gc_push_root(&sd_idx);
+    ep_gc_push_root(&sdef);
+    ep_gc_push_root(&sfields);
+    ep_gc_push_root(&sf_idx);
+    ep_gc_push_root(&sf);
+    ep_gc_push_root(&sf_name);
+    ep_gc_push_root(&fs_idx);
+    ep_gc_push_root(&fname);
     ep_gc_push_root(&line);
     ep_gc_push_root(&slot_line);
     ep_gc_push_root(&tag_slots);
+    ep_gc_push_root(&enum_defs);
+    ep_gc_push_root(&ed_idx);
+    ep_gc_push_root(&edef);
+    ep_gc_push_root(&evariants);
+    ep_gc_push_root(&ev_idx);
+    ep_gc_push_root(&ev);
+    ep_gc_push_root(&ev_name);
+    ep_gc_push_root(&ts_idx);
+    ep_gc_push_root(&tname);
+    ep_gc_push_root(&vpat_keys);
+    ep_gc_push_root(&vpat_vals);
+    ep_gc_push_root(&vp_enums);
+    ep_gc_push_root(&vp_i);
+    ep_gc_push_root(&vp_variants);
+    ep_gc_push_root(&vpv_i);
+    ep_gc_push_root(&vp_var);
+    ep_gc_push_root(&vp_fields);
     ep_gc_push_root(&vp_codes);
+    ep_gc_push_root(&vpf_i);
+    ep_gc_push_root(&try_keys);
+    ep_gc_push_root(&try_vals);
+    ep_gc_push_root(&all_enums);
+    ep_gc_push_root(&try_funcs);
+    ep_gc_push_root(&tf_i);
+    ep_gc_push_root(&tf);
     ep_gc_push_root(&rt);
+    ep_gc_push_root(&en_i);
+    ep_gc_push_root(&evs);
+    ep_gc_push_root(&constants);
+    ep_gc_push_root(&ci);
+    ep_gc_push_root(&cstmt);
     ep_gc_push_root(&gline);
+    ep_gc_push_root(&gn);
     ep_gc_push_root(&ml);
     ep_gc_push_root(&gk);
     ep_gc_push_root(&gv);
     ep_gc_push_root(&ival);
     ep_gc_push_root(&il);
+    ep_gc_push_root(&externals);
+    ep_gc_push_root(&idx);
+    ep_gc_push_root(&ext);
+    ep_gc_push_root(&name);
+    ep_gc_push_root(&params);
     ep_gc_push_root(&proto);
+    ep_gc_push_root(&funcs);
+    ep_gc_push_root(&func);
     ep_gc_push_root(&proto2);
     ep_gc_push_root(&spawn_list);
+    ep_gc_push_root(&spawn_node);
+    ep_gc_push_root(&args);
     ep_gc_push_root(&struct_decl);
+    ep_gc_push_root(&j);
     ep_gc_push_root(&wrap_fn);
+    ep_gc_push_root(&c_name);
+    ep_gc_push_root(&out_lines);
+    ep_gc_push_root(&closure_slot);
+    ep_gc_push_root(&method_defs);
+    ep_gc_push_root(&md_idx);
+    ep_gc_push_root(&mdef);
+    ep_gc_push_root(&mname);
+    ep_gc_push_root(&mparams);
+    ep_gc_push_root(&mbody);
+    ep_gc_push_root(&full_params);
+    ep_gc_push_root(&self_param);
+    ep_gc_push_root(&mp_idx);
+    ep_gc_push_root(&mp);
+    ep_gc_push_root(&method_func);
     ep_gc_push_root(&emitted_methods);
+    ep_gc_push_root(&trait_impls);
+    ep_gc_push_root(&ti_idx);
+    ep_gc_push_root(&timpl);
+    ep_gc_push_root(&imethods);
+    ep_gc_push_root(&im_idx);
+    ep_gc_push_root(&imeth);
+    ep_gc_push_root(&imeth_name);
+    ep_gc_push_root(&tparams);
+    ep_gc_push_root(&tbody);
+    ep_gc_push_root(&tfull);
+    ep_gc_push_root(&tself);
+    ep_gc_push_root(&tp_idx);
+    ep_gc_push_root(&tfunc);
+    ep_gc_push_root(&lines);
+    ep_gc_push_root(&cbodies);
+    ep_gc_push_root(&marker_line);
     ep_gc_push_root(&spliced);
     ep_gc_push_root(&c_code);
+    ep_gc_push_root(&program);
     ep_gc_maybe_collect();
 
     state = create_codegen_state();
     ok = analyze_return_types(state, program);
+    ok = collect_prim_param_flags(state, program);
     if (length_list(program) > 8LL) {
     it_impls = get_list(program, 8LL);
     it_i = 0LL;
@@ -15445,6 +17645,8 @@ long long generate_c(long long program, long long is_test_mode) {
     wrap_fn = (long long)"void* spawn_wrapper_";
     wrap_fn = string_concat(wrap_fn, cg_int_to_str(idx));
     wrap_fn = string_concat(wrap_fn, (long long)"(void* r) {\n");
+    wrap_fn = string_concat(wrap_fn, (long long)"    int stack_dummy;\n");
+    wrap_fn = string_concat(wrap_fn, (long long)"    ep_gc_register_thread(&stack_dummy);\n");
     wrap_fn = string_concat(wrap_fn, (long long)"    spawn_args_");
     wrap_fn = string_concat(wrap_fn, cg_int_to_str(idx));
     wrap_fn = string_concat(wrap_fn, (long long)"* args = (spawn_args_");
@@ -15468,6 +17670,7 @@ long long generate_c(long long program, long long is_test_mode) {
     }
     wrap_fn = string_concat(wrap_fn, (long long)");\n");
     wrap_fn = string_concat(wrap_fn, (long long)"    free(args);\n");
+    wrap_fn = string_concat(wrap_fn, (long long)"    ep_gc_unregister_thread();\n");
     wrap_fn = string_concat(wrap_fn, (long long)"    return NULL;\n");
     wrap_fn = string_concat(wrap_fn, (long long)"}\n\n");
     ok = emit(state, wrap_fn);
@@ -15565,7 +17768,7 @@ long long generate_c(long long program, long long is_test_mode) {
     ret_val = c_code;
     goto L_cleanup;
 L_cleanup:
-    ep_gc_pop_roots(21);
+    ep_gc_pop_roots(104);
     return ret_val;
 }
 
@@ -16464,13 +18667,27 @@ long long ep_rt_core_5() {
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"static long long sleep_ms(long long ms) {\n");
+    ok = append_list(lines, (long long)"    /* Outside the event loop (no task is being stepped) a registered timer\n");
+    ok = append_list(lines, (long long)"       would never fire on its own, so the cooperative path used to sleep for\n");
+    ok = append_list(lines, (long long)"       0 ms. Block for real instead, and hand back an already-completed\n");
+    ok = append_list(lines, (long long)"       future so `await sleep_ms(...)` from synchronous code still works. */\n");
+    ok = append_list(lines, (long long)"    if (!ep_current_task) {\n");
+    ok = append_list(lines, (long long)"        if (ms > 0) ep_sleep_ms(ms);\n");
+    ok = append_list(lines, (long long)"        EpFuture* done = (EpFuture*)malloc(sizeof(EpFuture));\n");
+    ok = append_list(lines, (long long)"        done->completed = 1;\n");
+    ok = append_list(lines, (long long)"        done->value = 0;\n");
+    ok = append_list(lines, (long long)"        done->waiting_task = NULL;\n");
+    ok = append_list(lines, (long long)"        done->chan = 0;\n");
+    ok = append_list(lines, (long long)"        { EpGCObject* _go = ep_gc_register(done, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }\n");
+    ok = append_list(lines, (long long)"        return (long long)done;\n");
+    ok = append_list(lines, (long long)"    }\n");
     ok = append_list(lines, (long long)"    EpFuture* fut = (EpFuture*)malloc(sizeof(EpFuture));\n");
     ok = append_list(lines, (long long)"    fut->completed = 0;\n");
     ok = append_list(lines, (long long)"    fut->value = 0;\n");
     ok = append_list(lines, (long long)"    fut->waiting_task = NULL;\n");
     ok = append_list(lines, (long long)"    fut->chan = 0;\n");
     ok = append_list(lines, (long long)"    { EpGCObject* _go = ep_gc_register(fut, EP_OBJ_STRUCT); if(_go) _go->num_fields = 3; }\n");
-    ok = append_list(lines, (long long)"    \n");
+    ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"    EpSleepTimerArgs* args = (EpSleepTimerArgs*)malloc(sizeof(EpSleepTimerArgs));\n");
     ok = append_list(lines, (long long)"    args->fut = fut;\n");
     ok = append_list(lines, (long long)"    \n");
@@ -16544,20 +18761,6 @@ long long ep_rt_core_5() {
     ok = append_list(lines, (long long)"static pthread_cond_t ep_gc_resume_cond = PTHREAD_COND_INITIALIZER;\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"/* Function pointer for channel scanning — set after EpChannel is defined.\n");
-    ok = append_list(lines, (long long)"   GC mark calls this to scan values in-transit in channel buffers. */\n");
-    ok = append_list(lines, (long long)"static void (*ep_gc_scan_channels_major)(void) = NULL;\n");
-    ok = append_list(lines, (long long)"static void (*ep_gc_scan_channels_minor)(void) = NULL;\n");
-    ok = append_list(lines, (long long)"/* Function pointers for marking top-level constant/global variables, which are\n");
-    ok = append_list(lines, (long long)"   GC roots that live outside any function frame. Set by __ep_init_constants. */\n");
-    ok = append_list(lines, (long long)"static void (*ep_gc_mark_globals_major)(void) = NULL;\n");
-    ok = append_list(lines, (long long)"static void (*ep_gc_mark_globals_minor)(void) = NULL;\n");
-    ok = append_list(lines, (long long)"/* Function pointers for map value traversal — set after EpMap is defined.\n");
-    ok = append_list(lines, (long long)"   GC mark calls these to recursively mark values stored in maps. */\n");
-    ok = append_list(lines, (long long)"static void (*ep_gc_mark_map_values)(void* ptr) = NULL;\n");
-    ok = append_list(lines, (long long)"static void (*ep_gc_mark_map_values_minor)(void* ptr) = NULL;\n");
-    ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"/* Thread registry for GC root scanning in multi-threaded environment */\n");
-    ok = append_list(lines, (long long)"#define EP_MAX_THREADS 256\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -16574,6 +18777,20 @@ long long ep_rt_core_6() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"   GC mark calls this to scan values in-transit in channel buffers. */\n");
+    ok = append_list(lines, (long long)"static void (*ep_gc_scan_channels_major)(void) = NULL;\n");
+    ok = append_list(lines, (long long)"static void (*ep_gc_scan_channels_minor)(void) = NULL;\n");
+    ok = append_list(lines, (long long)"/* Function pointers for marking top-level constant/global variables, which are\n");
+    ok = append_list(lines, (long long)"   GC roots that live outside any function frame. Set by __ep_init_constants. */\n");
+    ok = append_list(lines, (long long)"static void (*ep_gc_mark_globals_major)(void) = NULL;\n");
+    ok = append_list(lines, (long long)"static void (*ep_gc_mark_globals_minor)(void) = NULL;\n");
+    ok = append_list(lines, (long long)"/* Function pointers for map value traversal — set after EpMap is defined.\n");
+    ok = append_list(lines, (long long)"   GC mark calls these to recursively mark values stored in maps. */\n");
+    ok = append_list(lines, (long long)"static void (*ep_gc_mark_map_values)(void* ptr) = NULL;\n");
+    ok = append_list(lines, (long long)"static void (*ep_gc_mark_map_values_minor)(void* ptr) = NULL;\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"/* Thread registry for GC root scanning in multi-threaded environment */\n");
+    ok = append_list(lines, (long long)"#define EP_MAX_THREADS 256\n");
     ok = append_list(lines, (long long)"static __thread void* volatile ep_thread_local_top = NULL;\n");
     ok = append_list(lines, (long long)"static __thread void* ep_thread_local_bottom = NULL;\n");
     ok = append_list(lines, (long long)"\n");
@@ -16710,20 +18927,6 @@ long long ep_rt_core_6() {
     ok = append_list(lines, (long long)"        /* Allocate or reuse heap state for this slot */\n");
     ok = append_list(lines, (long long)"        if (!ep_thread_gc_states[slot]) {\n");
     ok = append_list(lines, (long long)"            ep_thread_gc_states[slot] = (EpThreadGCState*)calloc(1, sizeof(EpThreadGCState));\n");
-    ok = append_list(lines, (long long)"        }\n");
-    ok = append_list(lines, (long long)"        ep_thread_gc_states[slot]->sp = 0;\n");
-    ok = append_list(lines, (long long)"        ep_thread_slot = slot;\n");
-    ok = append_list(lines, (long long)"        __sync_synchronize();  /* Memory barrier: state must be visible before active */\n");
-    ok = append_list(lines, (long long)"        ep_thread_active[slot] = 1;\n");
-    ok = append_list(lines, (long long)"    }\n");
-    ok = append_list(lines, (long long)"    pthread_mutex_unlock(&ep_gc_mutex);\n");
-    ok = append_list(lines, (long long)"}\n");
-    ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"static void ep_gc_unregister_thread(void) {\n");
-    ok = append_list(lines, (long long)"    pthread_mutex_lock(&ep_gc_mutex);\n");
-    ok = append_list(lines, (long long)"    for (int i = 0; i < ep_num_threads; i++) {\n");
-    ok = append_list(lines, (long long)"        if (ep_thread_active[i] && ep_thread_tops[i] == &ep_thread_local_top) {\n");
-    ok = append_list(lines, (long long)"            /* Zero root count FIRST — even if ep_gc_mark races past the\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -16740,6 +18943,20 @@ long long ep_rt_core_7() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"        }\n");
+    ok = append_list(lines, (long long)"        ep_thread_gc_states[slot]->sp = 0;\n");
+    ok = append_list(lines, (long long)"        ep_thread_slot = slot;\n");
+    ok = append_list(lines, (long long)"        __sync_synchronize();  /* Memory barrier: state must be visible before active */\n");
+    ok = append_list(lines, (long long)"        ep_thread_active[slot] = 1;\n");
+    ok = append_list(lines, (long long)"    }\n");
+    ok = append_list(lines, (long long)"    pthread_mutex_unlock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"static void ep_gc_unregister_thread(void) {\n");
+    ok = append_list(lines, (long long)"    pthread_mutex_lock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"    for (int i = 0; i < ep_num_threads; i++) {\n");
+    ok = append_list(lines, (long long)"        if (ep_thread_active[i] && ep_thread_tops[i] == &ep_thread_local_top) {\n");
+    ok = append_list(lines, (long long)"            /* Zero root count FIRST — even if ep_gc_mark races past the\n");
     ok = append_list(lines, (long long)"               active check, it will see sp=0 and walk no roots instead\n");
     ok = append_list(lines, (long long)"               of dereferencing stale __thread pointers */\n");
     ok = append_list(lines, (long long)"            if (ep_thread_gc_states[i]) {\n");
@@ -16876,20 +19093,6 @@ long long ep_rt_core_7() {
     ok = append_list(lines, (long long)"    ep_gc_head = obj;\n");
     ok = append_list(lines, (long long)"    ep_gc_count++;\n");
     ok = append_list(lines, (long long)"    ep_gc_nursery_count++;\n");
-    ok = append_list(lines, (long long)"    ep_gc_table_insert(ptr, obj);\n");
-    ok = append_list(lines, (long long)"    pthread_mutex_unlock(&ep_gc_mutex);\n");
-    ok = append_list(lines, (long long)"    return obj;\n");
-    ok = append_list(lines, (long long)"}\n");
-    ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"/* Find GC object by pointer.\n");
-    ok = append_list(lines, (long long)"   Takes ep_gc_mutex because ep_gc_table_insert may realloc+free the table\n");
-    ok = append_list(lines, (long long)"   concurrently (from another thread's allocation). Mutator-side callers\n");
-    ok = append_list(lines, (long long)"   (write barrier, free_struct/free_map/free_list, to-string) must use this\n");
-    ok = append_list(lines, (long long)"   locking variant; code already holding the mutex (mark/sweep) calls\n");
-    ok = append_list(lines, (long long)"   ep_gc_table_get directly to avoid a non-recursive double-lock deadlock. */\n");
-    ok = append_list(lines, (long long)"static EpGCObject* ep_gc_find(void* ptr) {\n");
-    ok = append_list(lines, (long long)"    pthread_mutex_lock(&ep_gc_mutex);\n");
-    ok = append_list(lines, (long long)"    ep_gc_park_if_stopped();  /* safepoint */\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -16906,6 +19109,20 @@ long long ep_rt_core_8() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"    ep_gc_table_insert(ptr, obj);\n");
+    ok = append_list(lines, (long long)"    pthread_mutex_unlock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"    return obj;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"/* Find GC object by pointer.\n");
+    ok = append_list(lines, (long long)"   Takes ep_gc_mutex because ep_gc_table_insert may realloc+free the table\n");
+    ok = append_list(lines, (long long)"   concurrently (from another thread's allocation). Mutator-side callers\n");
+    ok = append_list(lines, (long long)"   (write barrier, free_struct/free_map/free_list, to-string) must use this\n");
+    ok = append_list(lines, (long long)"   locking variant; code already holding the mutex (mark/sweep) calls\n");
+    ok = append_list(lines, (long long)"   ep_gc_table_get directly to avoid a non-recursive double-lock deadlock. */\n");
+    ok = append_list(lines, (long long)"static EpGCObject* ep_gc_find(void* ptr) {\n");
+    ok = append_list(lines, (long long)"    pthread_mutex_lock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"    ep_gc_park_if_stopped();  /* safepoint */\n");
     ok = append_list(lines, (long long)"    EpGCObject* obj = ep_gc_table_get(ptr);\n");
     ok = append_list(lines, (long long)"    pthread_mutex_unlock(&ep_gc_mutex);\n");
     ok = append_list(lines, (long long)"    return obj;\n");
@@ -17042,20 +19259,6 @@ long long ep_rt_core_8() {
     ok = append_list(lines, (long long)"#  define EP_NO_ASAN __attribute__((no_sanitize_address))\n");
     ok = append_list(lines, (long long)"# endif\n");
     ok = append_list(lines, (long long)"#endif\n");
-    ok = append_list(lines, (long long)"#ifndef EP_NO_ASAN\n");
-    ok = append_list(lines, (long long)"# define EP_NO_ASAN\n");
-    ok = append_list(lines, (long long)"#endif\n");
-    ok = append_list(lines, (long long)"EP_NO_ASAN\n");
-    ok = append_list(lines, (long long)"static void ep_gc_scan_thread_stacks(void) {\n");
-    ok = append_list(lines, (long long)"    jmp_buf _regs;\n");
-    ok = append_list(lines, (long long)"    volatile char _top_marker;\n");
-    ok = append_list(lines, (long long)"    memset(&_regs, 0, sizeof(_regs));\n");
-    ok = append_list(lines, (long long)"    setjmp(_regs);   /* spill the collector's own registers onto its stack */\n");
-    ok = append_list(lines, (long long)"    /* Publish the LOWEST of our own local addresses as this thread's live top, so the\n");
-    ok = append_list(lines, (long long)"       scanned range covers both the stack marker and the register-spill buffer whatever\n");
-    ok = append_list(lines, (long long)"       order the compiler laid them out (a missed _regs would drop a register-only root). */\n");
-    ok = append_list(lines, (long long)"    { char* _a = (char*)(void*)&_top_marker; char* _b = (char*)(void*)&_regs;\n");
-    ok = append_list(lines, (long long)"      ep_thread_local_top = (void*)((_a < _b) ? _a : _b); }\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -17072,6 +19275,20 @@ long long ep_rt_core_9() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"#ifndef EP_NO_ASAN\n");
+    ok = append_list(lines, (long long)"# define EP_NO_ASAN\n");
+    ok = append_list(lines, (long long)"#endif\n");
+    ok = append_list(lines, (long long)"EP_NO_ASAN\n");
+    ok = append_list(lines, (long long)"static void ep_gc_scan_thread_stacks(void) {\n");
+    ok = append_list(lines, (long long)"    jmp_buf _regs;\n");
+    ok = append_list(lines, (long long)"    volatile char _top_marker;\n");
+    ok = append_list(lines, (long long)"    memset(&_regs, 0, sizeof(_regs));\n");
+    ok = append_list(lines, (long long)"    setjmp(_regs);   /* spill the collector's own registers onto its stack */\n");
+    ok = append_list(lines, (long long)"    /* Publish the LOWEST of our own local addresses as this thread's live top, so the\n");
+    ok = append_list(lines, (long long)"       scanned range covers both the stack marker and the register-spill buffer whatever\n");
+    ok = append_list(lines, (long long)"       order the compiler laid them out (a missed _regs would drop a register-only root). */\n");
+    ok = append_list(lines, (long long)"    { char* _a = (char*)(void*)&_top_marker; char* _b = (char*)(void*)&_regs;\n");
+    ok = append_list(lines, (long long)"      ep_thread_local_top = (void*)((_a < _b) ? _a : _b); }\n");
     ok = append_list(lines, (long long)"    for (int t = 0; t < ep_num_threads; t++) {\n");
     ok = append_list(lines, (long long)"        if (!ep_thread_active[t]) continue;\n");
     ok = append_list(lines, (long long)"        if (!ep_thread_tops[t]) continue;\n");
@@ -17208,20 +19425,6 @@ long long ep_rt_core_9() {
     ok = append_list(lines, (long long)"        if (sp <= 0 || sp > EP_GC_MAX_ROOTS) continue;\n");
     ok = append_list(lines, (long long)"        for (int i = 0; i < sp; i++) {\n");
     ok = append_list(lines, (long long)"            long long* root_ptr = state->roots[i];\n");
-    ok = append_list(lines, (long long)"            if (!root_ptr) continue;\n");
-    ok = append_list(lines, (long long)"            long long val = *root_ptr;\n");
-    ok = append_list(lines, (long long)"            if (val != 0) {\n");
-    ok = append_list(lines, (long long)"                ep_gc_mark_object_minor((void*)val);\n");
-    ok = append_list(lines, (long long)"            }\n");
-    ok = append_list(lines, (long long)"        }\n");
-    ok = append_list(lines, (long long)"    }\n");
-    ok = append_list(lines, (long long)"    int local_sp = ep_gc_root_sp;\n");
-    ok = append_list(lines, (long long)"    if (local_sp > EP_GC_MAX_ROOTS) local_sp = EP_GC_MAX_ROOTS;\n");
-    ok = append_list(lines, (long long)"    for (int i = 0; i < local_sp; i++) {\n");
-    ok = append_list(lines, (long long)"        long long val = *ep_gc_root_stack[i];\n");
-    ok = append_list(lines, (long long)"        if (val != 0) {\n");
-    ok = append_list(lines, (long long)"            ep_gc_mark_object_minor((void*)val);\n");
-    ok = append_list(lines, (long long)"        }\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -17238,6 +19441,20 @@ long long ep_rt_core_10() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"            if (!root_ptr) continue;\n");
+    ok = append_list(lines, (long long)"            long long val = *root_ptr;\n");
+    ok = append_list(lines, (long long)"            if (val != 0) {\n");
+    ok = append_list(lines, (long long)"                ep_gc_mark_object_minor((void*)val);\n");
+    ok = append_list(lines, (long long)"            }\n");
+    ok = append_list(lines, (long long)"        }\n");
+    ok = append_list(lines, (long long)"    }\n");
+    ok = append_list(lines, (long long)"    int local_sp = ep_gc_root_sp;\n");
+    ok = append_list(lines, (long long)"    if (local_sp > EP_GC_MAX_ROOTS) local_sp = EP_GC_MAX_ROOTS;\n");
+    ok = append_list(lines, (long long)"    for (int i = 0; i < local_sp; i++) {\n");
+    ok = append_list(lines, (long long)"        long long val = *ep_gc_root_stack[i];\n");
+    ok = append_list(lines, (long long)"        if (val != 0) {\n");
+    ok = append_list(lines, (long long)"            ep_gc_mark_object_minor((void*)val);\n");
+    ok = append_list(lines, (long long)"        }\n");
     ok = append_list(lines, (long long)"    }\n");
     ok = append_list(lines, (long long)"    /* Mark active tasks in the scheduler run queue for minor collection */\n");
     ok = append_list(lines, (long long)"    EpTask* task = ep_run_queue_head;\n");
@@ -17374,20 +19591,6 @@ long long ep_rt_core_10() {
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"static void ep_gc_collect_major(void) {\n");
     ok = append_list(lines, (long long)"    if (!ep_gc_enabled) return;\n");
-    ok = append_list(lines, (long long)"    ep_gc_major_count++;\n");
-    ok = append_list(lines, (long long)"    ep_gc_mark();\n");
-    ok = append_list(lines, (long long)"    ep_gc_sweep_major();\n");
-    ok = append_list(lines, (long long)"    ep_gc_threshold = ep_gc_count * 2;\n");
-    ok = append_list(lines, (long long)"    if (ep_gc_threshold < 4096) ep_gc_threshold = 4096;\n");
-    ok = append_list(lines, (long long)"}\n");
-    ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"/* Run a full GC collection — caller MUST hold ep_gc_mutex */\n");
-    ok = append_list(lines, (long long)"static void ep_gc_collect(void) {\n");
-    ok = append_list(lines, (long long)"    ep_gc_collect_major();\n");
-    ok = append_list(lines, (long long)"}\n");
-    ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"/* Maybe trigger GC if we've exceeded threshold. Also serves as the per-function\n");
-    ok = append_list(lines, (long long)"   GC safepoint: if another thread has stopped the world, park here until it's done. */\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -17404,6 +19607,20 @@ long long ep_rt_core_11() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"    ep_gc_major_count++;\n");
+    ok = append_list(lines, (long long)"    ep_gc_mark();\n");
+    ok = append_list(lines, (long long)"    ep_gc_sweep_major();\n");
+    ok = append_list(lines, (long long)"    ep_gc_threshold = ep_gc_count * 2;\n");
+    ok = append_list(lines, (long long)"    if (ep_gc_threshold < 4096) ep_gc_threshold = 4096;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"/* Run a full GC collection — caller MUST hold ep_gc_mutex */\n");
+    ok = append_list(lines, (long long)"static void ep_gc_collect(void) {\n");
+    ok = append_list(lines, (long long)"    ep_gc_collect_major();\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"/* Maybe trigger GC if we've exceeded threshold. Also serves as the per-function\n");
+    ok = append_list(lines, (long long)"   GC safepoint: if another thread has stopped the world, park here until it's done. */\n");
     ok = append_list(lines, (long long)"static void ep_gc_maybe_collect(void) {\n");
     ok = append_list(lines, (long long)"    if (!ep_gc_enabled) return;  /* Early exit if GC suppressed (e.g. during channel ops) */\n");
     ok = append_list(lines, (long long)"    /* Safepoint: lock-free fast check, then park under the lock if a collection\n");
@@ -17540,20 +19757,6 @@ long long ep_rt_core_11() {
     ok = append_list(lines, (long long)"    long long head;\n");
     ok = append_list(lines, (long long)"    long long tail;\n");
     ok = append_list(lines, (long long)"    long long size;\n");
-    ok = append_list(lines, (long long)"    ep_mutex_t mutex;\n");
-    ok = append_list(lines, (long long)"    ep_cond_t cond_recv;\n");
-    ok = append_list(lines, (long long)"    ep_cond_t cond_send;\n");
-    ok = append_list(lines, (long long)"} EpChannel;\n");
-    ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"/* Global channel registry — allows GC to scan values in-transit in channel buffers.\n");
-    ok = append_list(lines, (long long)"   Without this, an object sent to a channel but not yet received has NO GC root:\n");
-    ok = append_list(lines, (long long)"   the sender has popped it, the receiver hasn't pushed it, and the channel buffer\n");
-    ok = append_list(lines, (long long)"   is not scanned. The GC sweeps it → receiver gets a dangling pointer. */\n");
-    ok = append_list(lines, (long long)"#define EP_MAX_CHANNELS 1024\n");
-    ok = append_list(lines, (long long)"static EpChannel* ep_channel_registry[EP_MAX_CHANNELS];\n");
-    ok = append_list(lines, (long long)"static int ep_channel_count = 0;\n");
-    ok = append_list(lines, (long long)"static pthread_mutex_t ep_channel_registry_mutex = PTHREAD_MUTEX_INITIALIZER;\n");
-    ok = append_list(lines, (long long)"\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -17570,6 +19773,20 @@ long long ep_rt_core_12() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"    ep_mutex_t mutex;\n");
+    ok = append_list(lines, (long long)"    ep_cond_t cond_recv;\n");
+    ok = append_list(lines, (long long)"    ep_cond_t cond_send;\n");
+    ok = append_list(lines, (long long)"} EpChannel;\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"/* Global channel registry — allows GC to scan values in-transit in channel buffers.\n");
+    ok = append_list(lines, (long long)"   Without this, an object sent to a channel but not yet received has NO GC root:\n");
+    ok = append_list(lines, (long long)"   the sender has popped it, the receiver hasn't pushed it, and the channel buffer\n");
+    ok = append_list(lines, (long long)"   is not scanned. The GC sweeps it → receiver gets a dangling pointer. */\n");
+    ok = append_list(lines, (long long)"#define EP_MAX_CHANNELS 1024\n");
+    ok = append_list(lines, (long long)"static EpChannel* ep_channel_registry[EP_MAX_CHANNELS];\n");
+    ok = append_list(lines, (long long)"static int ep_channel_count = 0;\n");
+    ok = append_list(lines, (long long)"static pthread_mutex_t ep_channel_registry_mutex = PTHREAD_MUTEX_INITIALIZER;\n");
+    ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"static void ep_register_channel(EpChannel* chan) {\n");
     ok = append_list(lines, (long long)"    pthread_mutex_lock(&ep_channel_registry_mutex);\n");
     ok = append_list(lines, (long long)"    if (ep_channel_count < EP_MAX_CHANNELS) {\n");
@@ -17703,23 +19920,9 @@ long long ep_rt_core_12() {
     ok = append_list(lines, (long long)"    return has;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"// Select: wait for any of N channels to have data, with timeout in ms\n");
-    ok = append_list(lines, (long long)"// channels_list is a list of channel pointers\n");
-    ok = append_list(lines, (long long)"// Returns index (0-based) of first ready channel, or -1 on timeout\n");
-    ok = append_list(lines, (long long)"long long channel_select(long long channels_list, long long timeout_ms) {\n");
-    ok = append_list(lines, (long long)"    EpList* list = (EpList*)channels_list;\n");
-    ok = append_list(lines, (long long)"    if (!list || list->length == 0) return -1;\n");
-    ok = append_list(lines, (long long)"    \n");
-    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
-    ok = append_list(lines, (long long)"    ULONGLONG start_tick = GetTickCount64();\n");
-    ok = append_list(lines, (long long)"#else\n");
-    ok = append_list(lines, (long long)"    struct timespec start, now;\n");
-    ok = append_list(lines, (long long)"    clock_gettime(CLOCK_MONOTONIC, &start);\n");
-    ok = append_list(lines, (long long)"#endif\n");
-    ok = append_list(lines, (long long)"    \n");
-    ok = append_list(lines, (long long)"    while (1) {\n");
-    ok = append_list(lines, (long long)"        // Poll all channels\n");
-    ok = append_list(lines, (long long)"        for (long long i = 0; i < list->length; i++) {\n");
+    ok = append_list(lines, (long long)"/* Leave a GC-safe blocking region (see channel_select). If a collection is\n");
+    ok = append_list(lines, (long long)"   in progress, wait for it to finish before running mutator code again. */\n");
+    ok = append_list(lines, (long long)"static void ep_gc_leave_blocking_region(void) {\n");
     ret_val = join_strings(lines);
     goto L_cleanup;
 L_cleanup:
@@ -17736,17 +19939,71 @@ long long ep_rt_core_13() {
     ep_gc_maybe_collect();
 
     lines = create_list();
+    ok = append_list(lines, (long long)"    if (ep_thread_slot < 0) return;\n");
+    ok = append_list(lines, (long long)"    pthread_mutex_lock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"    while (ep_gc_stop_requested) {\n");
+    ok = append_list(lines, (long long)"        pthread_cond_wait(&ep_gc_resume_cond, &ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"    }\n");
+    ok = append_list(lines, (long long)"    ep_gc_parked_count--;\n");
+    ok = append_list(lines, (long long)"    pthread_mutex_unlock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"// Select: wait for any of N channels to have data, with timeout in ms\n");
+    ok = append_list(lines, (long long)"// channels_list is a list of channel pointers\n");
+    ok = append_list(lines, (long long)"// Returns index (0-based) of first ready channel, or -1 on timeout\n");
+    ok = append_list(lines, (long long)"long long channel_select(long long channels_list, long long timeout_ms) {\n");
+    ok = append_list(lines, (long long)"    EpList* list = (EpList*)channels_list;\n");
+    ok = append_list(lines, (long long)"    if (!list || list->length == 0) return -1;\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
+    ok = append_list(lines, (long long)"    ULONGLONG start_tick = GetTickCount64();\n");
+    ok = append_list(lines, (long long)"#else\n");
+    ok = append_list(lines, (long long)"    struct timespec start, now;\n");
+    ok = append_list(lines, (long long)"    clock_gettime(CLOCK_MONOTONIC, &start);\n");
+    ok = append_list(lines, (long long)"#endif\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"    /* A GC-safe blocking region. A thread sitting in a long select must not\n");
+    ok = append_list(lines, (long long)"       stall every stop-the-world (waking it to park costs ~0.5ms per major\n");
+    ok = append_list(lines, (long long)"       collection — allocation-heavy code on another thread pays that tens of\n");
+    ok = append_list(lines, (long long)"       thousands of times). Instead, pin this frame's roots once — spill the\n");
+    ok = append_list(lines, (long long)"       callee-saved registers into this frame and publish the frame as the\n");
+    ok = append_list(lines, (long long)"       thread's stack top — and count the thread as already parked. The\n");
+    ok = append_list(lines, (long long)"       collector then proceeds immediately and scans [this frame, stack\n");
+    ok = append_list(lines, (long long)"       bottom], a range that is frozen for the whole select: the poll loop\n");
+    ok = append_list(lines, (long long)"       below only grows the stack DOWNWARD from here (excluded from the scan)\n");
+    ok = append_list(lines, (long long)"       and allocates nothing. On every way out, ep_gc_leave_blocking_region\n");
+    ok = append_list(lines, (long long)"       waits for any in-flight collection before mutator code resumes.\n");
+    ok = append_list(lines, (long long)"       (Without any of this, the collector scans a live, mutating stack\n");
+    ok = append_list(lines, (long long)"       against a stale top, misses the channels list held in a callee-saved\n");
+    ok = append_list(lines, (long long)"       register, sweeps it, and the next poll dereferences freed memory.) */\n");
+    ok = append_list(lines, (long long)"    jmp_buf _pin_regs;\n");
+    ok = append_list(lines, (long long)"    volatile char _pin_marker;\n");
+    ok = append_list(lines, (long long)"    if (ep_thread_slot >= 0) {\n");
+    ok = append_list(lines, (long long)"        memset(&_pin_regs, 0, sizeof(_pin_regs));\n");
+    ok = append_list(lines, (long long)"        setjmp(_pin_regs);\n");
+    ok = append_list(lines, (long long)"        pthread_mutex_lock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"        { char* _a = (char*)(void*)&_pin_marker; char* _b = (char*)(void*)&_pin_regs;\n");
+    ok = append_list(lines, (long long)"          ep_thread_local_top = (void*)((uintptr_t)((_a < _b) ? _a : _b) & ~(uintptr_t)7); }\n");
+    ok = append_list(lines, (long long)"        __sync_synchronize();\n");
+    ok = append_list(lines, (long long)"        ep_gc_parked_count++;\n");
+    ok = append_list(lines, (long long)"        pthread_mutex_unlock(&ep_gc_mutex);\n");
+    ok = append_list(lines, (long long)"    }\n");
+    ok = append_list(lines, (long long)"\n");
+    ok = append_list(lines, (long long)"    while (1) {\n");
+    ok = append_list(lines, (long long)"        // Poll all channels\n");
+    ok = append_list(lines, (long long)"        for (long long i = 0; i < list->length; i++) {\n");
     ok = append_list(lines, (long long)"            EpChannel* chan = (EpChannel*)list->data[i];\n");
     ok = append_list(lines, (long long)"            if (chan) {\n");
     ok = append_list(lines, (long long)"                ep_mutex_lock(&chan->mutex);\n");
     ok = append_list(lines, (long long)"                if (chan->size > 0) {\n");
     ok = append_list(lines, (long long)"                    ep_mutex_unlock(&chan->mutex);\n");
+    ok = append_list(lines, (long long)"                    ep_gc_leave_blocking_region();\n");
     ok = append_list(lines, (long long)"                    return i;\n");
     ok = append_list(lines, (long long)"                }\n");
     ok = append_list(lines, (long long)"                ep_mutex_unlock(&chan->mutex);\n");
     ok = append_list(lines, (long long)"            }\n");
     ok = append_list(lines, (long long)"        }\n");
-    ok = append_list(lines, (long long)"        \n");
+    ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"        // Check timeout\n");
     ok = append_list(lines, (long long)"        if (timeout_ms >= 0) {\n");
     ok = append_list(lines, (long long)"#ifdef _WIN32\n");
@@ -17756,7 +20013,10 @@ long long ep_rt_core_13() {
     ok = append_list(lines, (long long)"            clock_gettime(CLOCK_MONOTONIC, &now);\n");
     ok = append_list(lines, (long long)"            long long elapsed = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;\n");
     ok = append_list(lines, (long long)"#endif\n");
-    ok = append_list(lines, (long long)"            if (elapsed >= timeout_ms) return -1;\n");
+    ok = append_list(lines, (long long)"            if (elapsed >= timeout_ms) {\n");
+    ok = append_list(lines, (long long)"                ep_gc_leave_blocking_region();\n");
+    ok = append_list(lines, (long long)"                return -1;\n");
+    ok = append_list(lines, (long long)"            }\n");
     ok = append_list(lines, (long long)"        }\n");
     ok = append_list(lines, (long long)"        \n");
     ok = append_list(lines, (long long)"        // Brief sleep to avoid busy-wait\n");
@@ -17829,6 +20089,22 @@ long long ep_rt_core_13() {
     ok = append_list(lines, (long long)"    return 0;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_14() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"long long ep_dlclose(long long handle) {\n");
     ok = append_list(lines, (long long)"    (void)handle;\n");
     ok = append_list(lines, (long long)"    return 0;\n");
@@ -17886,22 +20162,6 @@ long long ep_rt_core_13() {
     ok = append_list(lines, (long long)"    int opt = 1;\n");
     ok = append_list(lines, (long long)"    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));\n");
     ok = append_list(lines, (long long)"    struct sockaddr_in serv_addr;\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_14() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    memset(&serv_addr, 0, sizeof(serv_addr));\n");
     ok = append_list(lines, (long long)"    serv_addr.sin_family = AF_INET;\n");
     ok = append_list(lines, (long long)"    serv_addr.sin_addr.s_addr = INADDR_ANY;\n");
@@ -17995,6 +20255,22 @@ long long ep_rt_core_14() {
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_play_sound(long long path) {\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_15() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    char cmd[512];\n");
     ok = append_list(lines, (long long)"    snprintf(cmd, sizeof(cmd), \"afplay '%s' &\", (const char*)path);\n");
     ok = append_list(lines, (long long)"    return (long long)system(cmd);\n");
@@ -18052,22 +20328,6 @@ long long ep_rt_core_14() {
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_dlcall0(long long fptr) {\n");
     ok = append_list(lines, (long long)"    return ((ep_fn0)fptr)();\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_15() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"long long ep_dlcall1(long long fptr, long long a0) {\n");
     ok = append_list(lines, (long long)"    return ((ep_fn1)fptr)(a0);\n");
@@ -18161,6 +20421,22 @@ long long ep_rt_core_15() {
     ok = append_list(lines, (long long)"typedef long long (*ep_fdi2)(double, double);\n");
     ok = append_list(lines, (long long)"typedef long long (*ep_fdi3)(double, double, double);\n");
     ok = append_list(lines, (long long)"\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_16() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"long long ep_dlcall_fd1(long long fptr, long long a0) {\n");
     ok = append_list(lines, (long long)"    return ((ep_fdi1)fptr)(ep_ll_to_double(a0));\n");
     ok = append_list(lines, (long long)"}\n");
@@ -18218,22 +20494,6 @@ long long ep_rt_core_15() {
     ok = append_list(lines, (long long)"            ep_gc_mark_object_minor((void*)map->entries[i].value);\n");
     ok = append_list(lines, (long long)"        }\n");
     ok = append_list(lines, (long long)"        if (map->entries[i].used && map->entries[i].key != NULL) {\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_16() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"            ep_gc_mark_object_minor((void*)map->entries[i].key);\n");
     ok = append_list(lines, (long long)"        }\n");
     ok = append_list(lines, (long long)"    }\n");
@@ -18327,6 +20587,22 @@ long long ep_rt_core_16() {
     ok = append_list(lines, (long long)"    long long start_h = h;\n");
     ok = append_list(lines, (long long)"    while (map->entries[h].used) {\n");
     ok = append_list(lines, (long long)"        if (map->entries[h].key && strcmp(map->entries[h].key, key) == 0) {\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_17() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"            return map->entries[h].value;\n");
     ok = append_list(lines, (long long)"        }\n");
     ok = append_list(lines, (long long)"        h = (h + 1) % map->capacity;\n");
@@ -18384,22 +20660,6 @@ long long ep_rt_core_16() {
     ok = append_list(lines, (long long)"            while (map->entries[next_h].used) {\n");
     ok = append_list(lines, (long long)"                char* k = map->entries[next_h].key;\n");
     ok = append_list(lines, (long long)"                long long v = map->entries[next_h].value;\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_17() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"                map->entries[next_h].key = NULL;\n");
     ok = append_list(lines, (long long)"                map->entries[next_h].value = 0;\n");
     ok = append_list(lines, (long long)"                map->entries[next_h].used = 0;\n");
@@ -18493,6 +20753,22 @@ long long ep_rt_core_17() {
     ok = append_list(lines, (long long)"    free(dq->data);\n");
     ok = append_list(lines, (long long)"    dq->data = new_data;\n");
     ok = append_list(lines, (long long)"    dq->capacity = new_capacity;\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_18() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    dq->head = 0;\n");
     ok = append_list(lines, (long long)"    dq->tail = dq->size;\n");
     ok = append_list(lines, (long long)"}\n");
@@ -18550,22 +20826,6 @@ long long ep_rt_core_17() {
     ok = append_list(lines, (long long)"    if (!dq) return 0;\n");
     ok = append_list(lines, (long long)"    free(dq->data);\n");
     ok = append_list(lines, (long long)"    free(dq);\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_18() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    return 0;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
@@ -18659,6 +20919,22 @@ long long ep_rt_core_18() {
     ok = append_list(lines, (long long)"/* HTTP Client */\n");
     ok = append_list(lines, (long long)"#ifdef __wasm__\n");
     ok = append_list(lines, (long long)"long long ep_http_request(long long method_val, long long url_val, long long headers_val, long long body_val) {\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_19() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    (void)method_val; (void)url_val; (void)headers_val; (void)body_val;\n");
     ok = append_list(lines, (long long)"    return (long long)strdup(\"Error: HTTP request is not supported on WebAssembly\");\n");
     ok = append_list(lines, (long long)"}\n");
@@ -18716,22 +20992,6 @@ long long ep_rt_core_18() {
     ok = append_list(lines, (long long)"        \"%s %s HTTP/1.1\\r\\n\"\n");
     ok = append_list(lines, (long long)"        \"Host: %s\\r\\n\"\n");
     ok = append_list(lines, (long long)"        \"Content-Length: %zu\\r\\n\"\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_19() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"        \"Connection: close\\r\\n\"\n");
     ok = append_list(lines, (long long)"        \"%s%s\"\n");
     ok = append_list(lines, (long long)"        \"\\r\\n\",\n");
@@ -18825,6 +21085,22 @@ long long ep_rt_core_19() {
     ok = append_list(lines, (long long)"    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;\n");
     ok = append_list(lines, (long long)"    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;\n");
     ok = append_list(lines, (long long)"}\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_20() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"void ep_sha256_init(EP_SHA256_CTX *ctx) {\n");
     ok = append_list(lines, (long long)"    ctx->datalen = 0; ctx->bitlen = 0;\n");
@@ -18882,22 +21158,6 @@ long long ep_rt_core_19() {
     ok = append_list(lines, (long long)"    ep_sha256_final(&ctx, hash);\n");
     ok = append_list(lines, (long long)"    char* result = malloc(65);\n");
     ok = append_list(lines, (long long)"    if (result) {\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_20() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"        for (int i = 0; i < 32; i++) {\n");
     ok = append_list(lines, (long long)"            snprintf(result + (i * 2), 3, \"%02x\", hash[i]);\n");
     ok = append_list(lines, (long long)"        }\n");
@@ -18991,6 +21251,22 @@ long long ep_rt_core_20() {
     ok = append_list(lines, (long long)"#define II(a,b,c,d,x,s,ac) { \\\n");
     ok = append_list(lines, (long long)"    (a) += I((b),(c),(d)) + (x) + (ac); \\\n");
     ok = append_list(lines, (long long)"    (a) = ROTATE_LEFT((a),(s)); \\\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_21() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    (a) += (b); \\\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
@@ -19048,22 +21324,6 @@ long long ep_rt_core_20() {
     ok = append_list(lines, (long long)"void ep_md5_final(EP_MD5_CTX *ctx, unsigned char digest[16]) {\n");
     ok = append_list(lines, (long long)"    unsigned char bits[8];\n");
     ok = append_list(lines, (long long)"    bits[0] = ctx->count[0]; bits[1] = ctx->count[0] >> 8; bits[2] = ctx->count[0] >> 16; bits[3] = ctx->count[0] >> 24;\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_21() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    bits[4] = ctx->count[1]; bits[5] = ctx->count[1] >> 8; bits[6] = ctx->count[1] >> 16; bits[7] = ctx->count[1] >> 24;\n");
     ok = append_list(lines, (long long)"    unsigned int index = (ctx->count[0] >> 3) & 0x3F, pad_len = (index < 56) ? (56 - index) : (120 - index);\n");
     ok = append_list(lines, (long long)"    unsigned char padding[64];\n");
@@ -19157,6 +21417,22 @@ long long ep_rt_core_21() {
     ok = append_list(lines, (long long)"long long append_list(long long list_ptr, long long value) {\n");
     ok = append_list(lines, (long long)"    if (EP_BADPTR(list_ptr)) return 0;\n");
     ok = append_list(lines, (long long)"    EpList* list = (EpList*)list_ptr;\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_22() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    if (!list) return 0;\n");
     ok = append_list(lines, (long long)"    if (list->length >= list->capacity) {\n");
     ok = append_list(lines, (long long)"        list->capacity *= 2;\n");
@@ -19214,22 +21490,6 @@ long long ep_rt_core_21() {
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long sqlite_get_callback_ptr(long long dummy) {\n");
     ok = append_list(lines, (long long)"    return (long long)sqlite_list_callback;\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_22() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"/* SQLite type-safe wrappers — marshal between int and long long */\n");
@@ -19323,6 +21583,22 @@ long long ep_rt_core_22() {
     ok = append_list(lines, (long long)"    ep_gc_register_thread((void*)&argc);\n");
     ok = append_list(lines, (long long)"    /* Wire up channel scanning for GC (defined after EpChannel struct) */\n");
     ok = append_list(lines, (long long)"    ep_gc_scan_channels_major = ep_gc_scan_channels_major_impl;\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_23() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    ep_gc_scan_channels_minor = ep_gc_scan_channels_minor_impl;\n");
     ok = append_list(lines, (long long)"    /* Wire up map value traversal for GC (defined after EpMap struct) */\n");
     ok = append_list(lines, (long long)"    ep_gc_mark_map_values = ep_gc_mark_map_values_impl;\n");
@@ -19380,22 +21656,6 @@ long long ep_rt_core_22() {
     ok = append_list(lines, (long long)"    char* sub = malloc(len + 1);\n");
     ok = append_list(lines, (long long)"    if (!sub) {\n");
     ok = append_list(lines, (long long)"        char* empty = malloc(1);\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_23() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"        if (empty) empty[0] = '\\0';\n");
     ok = append_list(lines, (long long)"        ep_gc_register(empty, EP_OBJ_STRING);\n");
     ok = append_list(lines, (long long)"        return empty;\n");
@@ -19489,6 +21749,22 @@ long long ep_rt_core_23() {
     ok = append_list(lines, (long long)"  #define popen _popen\n");
     ok = append_list(lines, (long long)"  #define pclose _pclose\n");
     ok = append_list(lines, (long long)"  #define getpid _getpid\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_24() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"  #define setenv(k, v, o) _putenv_s(k, v)\n");
     ok = append_list(lines, (long long)"  /* Minimal dirent polyfill for Windows */\n");
     ok = append_list(lines, (long long)"  #include <windows.h>\n");
@@ -19546,22 +21822,6 @@ long long ep_rt_core_23() {
     ok = append_list(lines, (long long)"    const char* path = (const char*)path_ptr;\n");
     ok = append_list(lines, (long long)"    const char* content = (const char*)content_ptr;\n");
     ok = append_list(lines, (long long)"    FILE* f = fopen(path, \"ab\");\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_24() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    if (!f) return 0;\n");
     ok = append_list(lines, (long long)"    fputs(content, f);\n");
     ok = append_list(lines, (long long)"    fclose(f);\n");
@@ -19655,6 +21915,22 @@ long long ep_rt_core_24() {
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_25() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"long long ep_time_year(long long ts) {\n");
     ok = append_list(lines, (long long)"    time_t t = (time_t)ts;\n");
     ok = append_list(lines, (long long)"    struct tm* tm = localtime(&t);\n");
@@ -19712,22 +21988,6 @@ long long ep_rt_core_24() {
     ok = append_list(lines, (long long)"    const char* val = getenv((const char*)name_ptr);\n");
     ok = append_list(lines, (long long)"    return val ? (long long)val : (long long)\"\";\n");
     ok = append_list(lines, (long long)"}\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_25() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_setenv(long long name_ptr, long long val_ptr) {\n");
     ok = append_list(lines, (long long)"    return setenv((const char*)name_ptr, (const char*)val_ptr, 1) == 0 ? 1 : 0;\n");
@@ -19821,6 +22081,22 @@ long long ep_rt_core_25() {
     ok = append_list(lines, (long long)"    /* If either value looks like a small integer (not a valid heap pointer),\n");
     ok = append_list(lines, (long long)"       fall back to integer comparison — strcmp would segfault. */\n");
     ok = append_list(lines, (long long)"    if ((unsigned long long)a_ptr < 4096ULL || (unsigned long long)b_ptr < 4096ULL) return 0;\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_26() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    return strcmp((const char*)a_ptr, (const char*)b_ptr) == 0 ? 1 : 0;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
@@ -19878,22 +22154,6 @@ long long ep_rt_core_25() {
     ok = append_list(lines, (long long)"long long ep_rwlock_create(void) {\n");
     ok = append_list(lines, (long long)"    SRWLOCK* rwl = (SRWLOCK*)malloc(sizeof(SRWLOCK));\n");
     ok = append_list(lines, (long long)"    InitializeSRWLock(rwl);\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_26() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    return (long long)rwl;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"long long ep_rwlock_read_lock(long long rwl) {\n");
@@ -19987,6 +22247,22 @@ long long ep_rt_core_26() {
     ok = append_list(lines, (long long)"long long ep_atomic_add(long long a, long long delta) {\n");
     ok = append_list(lines, (long long)"    return __atomic_fetch_add((long long*)a, delta, __ATOMIC_SEQ_CST);\n");
     ok = append_list(lines, (long long)"}\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_27() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_atomic_sub(long long a, long long delta) {\n");
     ok = append_list(lines, (long long)"    return __atomic_fetch_sub((long long*)a, delta, __ATOMIC_SEQ_CST);\n");
@@ -20044,22 +22320,6 @@ long long ep_rt_core_26() {
     ok = append_list(lines, (long long)"    return 0;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_27() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"/* Semaphore via mutex+condvar (portable) */\n");
     ok = append_list(lines, (long long)"typedef struct {\n");
     ok = append_list(lines, (long long)"    pthread_mutex_t mutex;\n");
@@ -20153,6 +22413,22 @@ long long ep_rt_core_27() {
     ok = append_list(lines, (long long)"    return ret == 0 ? 1 : 0;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_28() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"long long ep_regex_find(long long pattern_ptr, long long text_ptr) {\n");
     ok = append_list(lines, (long long)"    regex_t regex;\n");
     ok = append_list(lines, (long long)"    regmatch_t match;\n");
@@ -20210,22 +22486,6 @@ long long ep_rt_core_27() {
     ok = append_list(lines, (long long)"    memcpy(result, text, match.rm_so);\n");
     ok = append_list(lines, (long long)"    memcpy(result + match.rm_so, repl, rlen);\n");
     ok = append_list(lines, (long long)"    memcpy(result + match.rm_so + rlen, text + match.rm_eo, tlen - match.rm_eo);\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_28() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    result[new_len] = '\\0';\n");
     ok = append_list(lines, (long long)"    regfree(&regex);\n");
     ok = append_list(lines, (long long)"    return (long long)result;\n");
@@ -20319,6 +22579,22 @@ long long ep_rt_core_28() {
     ok = append_list(lines, (long long)"    FILE* f = fopen(path, \"wb\");\n");
     ok = append_list(lines, (long long)"    if (!f) return 0;\n");
     ok = append_list(lines, (long long)"    size_t len = strlen(content);\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_29() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    fwrite(content, 1, len, f);\n");
     ok = append_list(lines, (long long)"    fclose(f);\n");
     ok = append_list(lines, (long long)"    return 1;\n");
@@ -20376,22 +22652,6 @@ long long ep_rt_core_28() {
     ok = append_list(lines, (long long)"    if (!result) return (long long)strdup(s);\n");
     ok = append_list(lines, (long long)"    char* dst = result;\n");
     ok = append_list(lines, (long long)"    p = s;\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_29() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    while (*p) {\n");
     ok = append_list(lines, (long long)"        if (strncmp(p, old_str, old_len) == 0) {\n");
     ok = append_list(lines, (long long)"            memcpy(dst, new_str, new_len);\n");
@@ -20485,6 +22745,22 @@ long long ep_rt_core_29() {
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"// Auto-convert any value to string for string interpolation\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_30() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"long long ep_auto_to_string(long long val) {\n");
     ok = append_list(lines, (long long)"    // If the value is 0, return \"0\"\n");
     ok = append_list(lines, (long long)"    if (val == 0) return (long long)strdup(\"0\");\n");
@@ -20542,22 +22818,6 @@ long long ep_rt_core_29() {
     ok = append_list(lines, (long long)"    return (long long)buf;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_30() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"/* Format a Float (double bits carried in a long long) as a string. F-string\n");
     ok = append_list(lines, (long long)"   interpolation routes Float-typed expressions here: ep_auto_to_string cannot\n");
     ok = append_list(lines, (long long)"   know the bits are a double and would print them as a huge integer. Uses the\n");
@@ -20651,6 +22911,22 @@ long long ep_rt_core_30() {
     ok = append_list(lines, (long long)"    if (!val || *val != '\"') return (long long)strdup(\"\");\n");
     ok = append_list(lines, (long long)"    val++;\n");
     ok = append_list(lines, (long long)"    const char* end = val;\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_31() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    while (*end && *end != '\"') { if (*end == '\\\\') end++; end++; }\n");
     ok = append_list(lines, (long long)"    size_t len = end - val;\n");
     ok = append_list(lines, (long long)"    char* result = (char*)malloc(len + 1);\n");
@@ -20708,22 +22984,6 @@ long long ep_rt_core_30() {
     ok = append_list(lines, (long long)"    size_t len = strlen((const char*)data);\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"    unsigned int h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;\n");
-    ret_val = join_strings(lines);
-    goto L_cleanup;
-L_cleanup:
-    ep_gc_pop_roots(1);
-    return ret_val;
-}
-
-long long ep_rt_core_31() {
-    long long lines = 0;
-    long long ok = 0;
-    long long ret_val = 0;
-
-    ep_gc_push_root(&lines);
-    ep_gc_maybe_collect();
-
-    lines = create_list();
     ok = append_list(lines, (long long)"    size_t new_len = len + 1;\n");
     ok = append_list(lines, (long long)"    while (new_len % 64 != 56) new_len++;\n");
     ok = append_list(lines, (long long)"    unsigned char* msg = (unsigned char*)calloc(new_len + 8, 1);\n");
@@ -20817,6 +23077,22 @@ long long ep_rt_core_31() {
     ok = append_list(lines, (long long)"        ep_gc_register(arg_copy, EP_OBJ_STRING);\n");
     ok = append_list(lines, (long long)"        append_list(list_ptr, (long long)arg_copy);\n");
     ok = append_list(lines, (long long)"    }\n");
+    ret_val = join_strings(lines);
+    goto L_cleanup;
+L_cleanup:
+    ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long ep_rt_core_32() {
+    long long lines = 0;
+    long long ok = 0;
+    long long ret_val = 0;
+
+    ep_gc_push_root(&lines);
+    ep_gc_maybe_collect();
+
+    lines = create_list();
     ok = append_list(lines, (long long)"    return list_ptr;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
@@ -21061,6 +23337,7 @@ long long get_shared_runtime_source() {
     ok = append_list(parts, ep_rt_core_29());
     ok = append_list(parts, ep_rt_core_30());
     ok = append_list(parts, ep_rt_core_31());
+    ok = append_list(parts, ep_rt_core_32());
     ok = append_list(parts, ep_rt_builtins_0());
     ok = append_list(parts, ep_rt_builtins_1());
     ret_val = join_strings(parts);
