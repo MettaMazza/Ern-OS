@@ -37,13 +37,20 @@ You need a C compiler (clang) — nothing else.
 
 ```bash
 bash build_ern_os.sh    # builds the vendored Ernos compiler, then the OS
-./start_ern_os          # boots Ern-OS
+./start_ern_os          # boots into the desktop
+./start_ern_os --plain  # or the sentence-only shell
 ```
 
+On Windows it is the same, with clang and a Windows 10+ terminal —
+`build_ern_os.bat` then `start_ern_os.exe`. See
+[docs/running_on_windows.md](docs/running_on_windows.md).
+
 The first boot prepares the disk and asks you to become the administrator.
-Every later boot goes straight to the login. Say `help` inside the shell to
-see everything Ern-OS understands, or read
-[docs/the_command_language.md](docs/the_command_language.md).
+Every later boot goes straight to the login. Ern-OS opens a full-screen
+desktop — a Mac-style menu bar up top, a Windows-style taskbar below, your
+conversation and a live panel side by side; **Tab** flips the panel, and
+passwords show as `*`. Say `help` inside to see everything Ern-OS
+understands, or read [docs/the_command_language.md](docs/the_command_language.md).
 
 ## What it is
 
@@ -95,7 +102,8 @@ transcript — twice, to prove nothing is forgotten between boots.
 
 - ~~**M1 — boot, login, shell**~~ done.
 - ~~**M2 — services, apps, people**~~ done.
-- **M3 — the desktop**: a full-screen terminal desktop.
+- ~~**M3 — the desktop**~~ done: a full-screen terminal desktop, blending
+  Mac and Windows, portable to both.
 - **M4 — self-rebuild from within**: say `rebuild the system` inside
   Ern-OS and it recompiles itself with its own toolchain.
 - **Phase 2 — bare metal**: see the road map.

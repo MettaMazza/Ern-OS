@@ -28,3 +28,23 @@ define log_warning with text as Str:
 ### Record something that went wrong.
 define log_problem with text as Str:
     return log_line("problem" and text)
+
+### The most recent lines of the diary, newest last — at most `count` of
+### them. Used by the desktop's diary panel.
+define recent_log_lines with count:
+    set kept to create_list()
+    set whole to disk_read(system_log_path())
+    if string_length(whole) == 0:
+        return kept
+    set all to split(whole and "\n")
+    set n to length_list(all)
+    set start to n - count
+    if start < 0:
+        set start to 0
+    set i to start
+    repeat while i < n:
+        set line to concat(get_list(all and i) and "")
+        if string_length(line) > 0:
+            set ok to append_list(kept and line)
+        set i to i + 1
+    return kept

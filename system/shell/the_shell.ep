@@ -15,7 +15,7 @@ define login_flow:
         return failed
     set tries to 0
     repeat while tries < 3:
-        set password to ask("Your password? ")
+        set password to ask_secret("Your password? ")
         if verify_login(name and password) == 1:
             set role to account_role(name)
             set session to begin_session(name and role)

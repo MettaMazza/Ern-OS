@@ -4,24 +4,194 @@
 # Ern-OS that is allowed to write to the screen or read from the keyboard.
 # On bare metal, this file would be rewritten to drive a serial port or a
 # display directly — and nothing above it would change.
+#
+# The terminal has two moods. In the plain mood (the default, and all of
+# --plain) everything `say` prints goes straight to the screen. In the
+# full-screen mood, used by the desktop, `say` instead files each line
+# into a transcript the desktop paints inside its conversation window —
+# so the shell, the apps, and do_command never change a line, yet their
+# words land in the right place. A desktop also leaves a repaint hook here
+# so that a question asked from deep inside an app can redraw the screen
+# before it waits for the answer.
 
-### Show a line of text on the screen.
+# The screen's state, kept as a list so it survives across calls:
+#   spot 0  full-screen mood? (0 = plain, 1 = full screen)
+#   spot 1  the transcript (a list of lines) the desktop paints
+#   spot 2  the repaint hook (a list holding 0 or 1 closures)
+set the_screen to create_list()
+set screen_init_a to append_list(the_screen and 0)
+set screen_init_b to append_list(the_screen and create_list())
+set screen_init_c to append_list(the_screen and create_list())
+
+### Are we painting a full-screen desktop right now?
+define in_full_screen:
+    return get_list(the_screen and 0)
+
+### The transcript the desktop paints — every line said so far.
+define transcript:
+    return get_list(the_screen and 1)
+
+### File one line into the transcript.
+define transcript_add with text as Str:
+    set lines to get_list(the_screen and 1)
+    set ok to append_list(lines and concat(text and ""))
+    return 0
+
+### Change the last line of the transcript (used while typing a secret).
+define transcript_amend_last with text as Str:
+    set lines to get_list(the_screen and 1)
+    set n to length_list(lines)
+    if n == 0:
+        return transcript_add(text)
+    set ok to set_list(lines and n - 1 and concat(text and ""))
+    return 0
+
+### Show a line of text. In full-screen mood it joins the transcript;
+### otherwise it goes straight to the screen.
 define say with text as Str:
+    if in_full_screen() == 1:
+        return transcript_add(text)
     display concat(text and "")
     return 0
 
 ### Show a blank line.
 define say_nothing:
+    if in_full_screen() == 1:
+        return transcript_add("")
     display ""
     return 0
 
-### Ask a question and wait for the person to type an answer.
+### Write text with no newline, straight to the screen — the desktop's
+### own brush. Never captured; used only to paint chrome and escapes.
+### (screen_write places the exact bytes and adds nothing, so a full
+### frame does not scroll.)
+define paint with text as Str:
+    set ok to screen_write(concat(text and ""))
+    return 0
+
+# ---- The repaint hook ----
+
+### Let the desktop leave a way to redraw itself. The closure is called
+### with no meaningful argument whenever a question needs the screen
+### refreshed first.
+define set_repaint_hook with painter:
+    set hooks to get_list(the_screen and 2)
+    if length_list(hooks) == 0:
+        set ok to append_list(hooks and painter)
+    else:
+        set ok to set_list(hooks and 0 and painter)
+    return 0
+
+### Forget the repaint hook (when the desktop shuts down).
+define clear_repaint_hook:
+    set empty to create_list()
+    set ok to set_list(the_screen and 2 and empty)
+    return 0
+
+### Redraw the screen through the hook, if one is installed.
+define fire_repaint:
+    set hooks to get_list(the_screen and 2)
+    if length_list(hooks) == 0:
+        return 0
+    set painter to get_list(hooks and 0)
+    return painter(0)
+
+# ---- Asking questions ----
+
+### Ask a question and wait for a whole typed line. In full-screen mood
+### the question joins the transcript and the screen is redrawn before we
+### wait, so the prompt shows inside the window.
 define ask with prompt as Str:
+    if in_full_screen() == 1:
+        set ok to transcript_add(prompt)
+        set ok to fire_repaint()
+        set answer to read_line()
+        set clean to string_trim(concat(answer and ""))
+        set ok to transcript_amend_last(concat(prompt and clean))
+        return clean
     display_string(prompt)
     set answer to read_line()
     return string_trim(concat(answer and ""))
 
-### Push old text off the top of the screen.
+### Ask for something secret — a password. Each key shows as a star, and
+### Backspace rubs one out. Works with typed keys and with piped input
+### (so tests can drive it), in both moods.
+define ask_secret with prompt as Str:
+    if in_full_screen() == 1:
+        set ok to transcript_add(prompt)
+        set ok to fire_repaint()
+    else:
+        display_string(prompt)
+    set secret to ""
+    repeat while 1 == 1:
+        set key to read_key()
+        if key < 0:
+            break
+        if key == 10 || key == 13:
+            break
+        if key == 127 || key == 8:
+            set len to string_length(secret)
+            if len > 0:
+                set secret to substring(secret and 0 and len - 1)
+                set ok to paint(concat(char_from_code(8) and " "))
+                set ok to paint(char_from_code(8))
+        else:
+            if key >= 32:
+                set secret to concat(secret and char_from_code(key))
+                set ok to paint("*")
+    if in_full_screen() == 1:
+        set stars to ""
+        set i to 0
+        repeat while i < string_length(secret):
+            set stars to concat(stars and "*")
+            set i to i + 1
+        set ok to transcript_amend_last(concat(prompt and stars))
+        set ok to fire_repaint()
+    else:
+        display ""
+    return secret
+
+# ---- Raw keys and the screen's size ----
+
+### Read one key press and give back its number code. -1 at end of input.
+define read_one_key:
+    return read_key()
+
+### How many characters wide the screen is.
+define screen_columns:
+    return terminal_columns()
+
+### How many lines tall the screen is.
+define screen_rows:
+    return terminal_rows()
+
+# ---- Full-screen control ----
+
+### Start the transcript over (so one person never sees another's lines).
+define reset_transcript:
+    set fresh to create_list()
+    set ok to set_list(the_screen and 1 and fresh)
+    return 0
+
+### Step into the full-screen desktop: switch to the alternate screen so
+### the person's scrollback is untouched, and start capturing lines.
+define enter_full_screen:
+    set ok to paint(concat(char_from_code(27) and "[?1049h"))
+    set ok to paint(concat(char_from_code(27) and "[2J"))
+    set ok to reset_transcript()
+    set ok to set_list(the_screen and 0 and 1)
+    return 0
+
+### Leave the full-screen desktop: stop capturing, show the cursor, and
+### return to the ordinary screen exactly as it was.
+define leave_full_screen:
+    set ok to set_list(the_screen and 0 and 0)
+    set ok to clear_repaint_hook()
+    set ok to paint(concat(char_from_code(27) and "[?25h"))
+    set ok to paint(concat(char_from_code(27) and "[?1049l"))
+    return 0
+
+### Push old text off the top of the screen (plain mood only).
 define clear_screen:
     set i to 0
     repeat while i < 40:

@@ -46,6 +46,21 @@ Inside **notes**: `list`, `edit <name>`, then `add <words>`,
 `change <number> to <words>`, `remove <number>`, `show`, `save`, `done`.
 Inside **files**: say a door number to open it, or `up`, `home`, `done`.
 
+## The desktop
+
+By default Ern-OS boots into a full-screen desktop: a menu bar across the
+top with the clock and who is signed in, your conversation in a window on
+the left, a live panel on the right, and a taskbar along the bottom
+listing the apps and the heartbeat. You still talk to it in the same
+sentences — the desktop is only the face.
+
+- **Tab** flips the right-hand panel between *at a glance* (you, where you
+  are, uptime, beats), *notes here* (what is in this folder), and *the
+  diary* (the latest lines of the system log).
+- Passwords you type show as `*` and never appear on screen.
+- `start ern_os --plain` skips the desktop and gives the sentence-only
+  shell — handy over a plain pipe, and what the tests drive.
+
 ## People (admins only)
 
 | say | it means |

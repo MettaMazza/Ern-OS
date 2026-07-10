@@ -12,6 +12,7 @@
 external define ep_os_name:
 external define ep_arch_name:
 external define ep_exit with code:
+external define ep_get_args:
 
 ### The name of the system underneath us, like "Darwin" or "Linux".
 define machine_system_name:
@@ -20,6 +21,18 @@ define machine_system_name:
 ### The kind of processor, like "arm64" or "x86_64".
 define machine_chip_name:
     return concat(ep_arch_name() and "")
+
+### The words Ern-OS was started with, like "--plain".
+define machine_arguments:
+    return ep_get_args()
+
+### Was this word among the ones Ern-OS was started with?
+define machine_started_with with flag as Str:
+    set args to ep_get_args()
+    for each arg in args:
+        if string_equals(concat(arg and "") and flag) == 1:
+            return 1
+    return 0
 
 ### Stop the machine. This ends Ern-OS itself.
 define machine_power_off with code:

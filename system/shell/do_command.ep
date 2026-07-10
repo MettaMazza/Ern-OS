@@ -117,7 +117,7 @@ define perform_command with session and services and board and cmd:
         if account_exists(target) == 1:
             set ok to say(f"There is already someone called {target}.")
             return 0
-        set password to ask(f"Choose a password for {target} (at least 4 characters): ")
+        set password to ask_secret(f"Choose a password for {target} (at least 4 characters): ")
         set made to create_account(target and password and "member")
         if made == 1:
             set ok to say(f"Welcome aboard, {target}. Their home is /home/{target}.")

@@ -1,0 +1,55 @@
+# test_screen_painting — do the desktop's brushes measure up exactly?
+#
+# Compile and run from the repo root. Pure strings, so no disk is touched.
+
+import "string"
+import "../system/desktop/screen_painting.ep"
+
+define expect_text with label as Str and got as Str and wanted as Str:
+    if string_equals(got and wanted) == 1:
+        display concat("PASS: " and label)
+        return 0
+    display concat("FAIL: " and label)
+    display f"  wanted [{wanted}]"
+    display f"  but got [{got}]"
+    return 1
+
+define expect_number with label as Str and got and wanted:
+    if got == wanted:
+        display concat("PASS: " and label)
+        return 0
+    display concat("FAIL: " and label)
+    display f"  wanted {wanted} but got {got}"
+    return 1
+
+define main:
+    set bad to 0
+
+    # fit pads and truncates to an exact width
+    set bad to bad + expect_text("fit pads" and fit("hi" and 6) and "hi    ")
+    set bad to bad + expect_text("fit truncates" and fit("hello world" and 5) and "hello")
+    set bad to bad + expect_number("fit width exact" and string_length(fit("x" and 20)) and 20)
+
+    # frames are exactly the requested width, with clean corners
+    set bad to bad + expect_number("frame_top width" and string_length(frame_top("conversation" and 40)) and 40)
+    set bad to bad + expect_number("frame_bottom width" and string_length(frame_bottom(40)) and 40)
+    set bad to bad + expect_number("frame_row width" and string_length(frame_row("some text" and 40)) and 40)
+    set bad to bad + expect_text("frame_top begins" and substring(frame_top("hi" and 12) and 0 and 8) and "+--[ hi ")
+    set bad to bad + expect_text("frame_bottom is dashes" and frame_bottom(6) and "+----+")
+    set bad to bad + expect_text("frame_row wraps" and frame_row("ab" and 6) and "| ab |")
+
+    # justify pins left and right text to the two ends
+    set bad to bad + expect_text("justify" and justify("L" and "R" and 5) and "L   R")
+    set bad to bad + expect_number("justify width" and string_length(justify("left" and "right" and 40)) and 40)
+
+    # run_of makes a solid run
+    set bad to bad + expect_text("run_of" and run_of("-" and 4) and "----")
+
+    # escape codes start with the real ESC byte (code 27)
+    set bad to bad + expect_number("move_to starts ESC" and get_character(move_to(3 and 5) and 0) and 27)
+    set bad to bad + expect_text("move_to body" and move_to(3 and 5) and concat(char_from_code(27) and "[3;5H"))
+    set bad to bad + expect_number("colour_on starts ESC" and get_character(colour_on("44;37") and 0) and 27)
+    set bad to bad + expect_text("colour_off" and colour_off() and concat(char_from_code(27) and "[0m"))
+
+    display f"RESULT: {bad} failed"
+    return 0

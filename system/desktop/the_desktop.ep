@@ -1,0 +1,317 @@
+# the_desktop — the full-screen face of Ern-OS.
+#
+# Userland (desktop). A Mac-style menu bar across the top, a Windows-style
+# taskbar across the bottom, and in between two windows side by side: the
+# conversation on the left and a live panel on the right that Tab flips
+# between "at a glance", "notes here" and "the diary".
+#
+# The desktop is only a face. Every sentence still goes to the very same
+# understand_command and perform_command the plain shell uses; the terminal
+# quietly files what they say into a transcript, and this file paints it.
+
+# The desktop's own memory (a list so it survives across calls):
+#   spot 0  which side panel is showing (0 glance, 1 notes, 2 diary)
+set desktop_state to create_list()
+set desktop_state_init to append_list(desktop_state and 0)
+
+### Which side panel is showing.
+define panel_index:
+    return get_list(desktop_state and 0)
+
+### Flip to the next side panel.
+define flip_panel:
+    set next to panel_index() + 1
+    if next > 2:
+        set next to 0
+    set ok to set_list(desktop_state and 0 and next)
+    return 0
+
+### The title over the current side panel.
+define panel_title:
+    set idx to panel_index()
+    if idx == 1:
+        return "notes here"
+    if idx == 2:
+        return "the diary"
+    return "at a glance"
+
+# ---- Layout ----
+
+### The screen width, guarded against silly sizes.
+define desk_columns:
+    set c to screen_columns()
+    if c < 40:
+        return 80
+    return c
+
+### The screen height, guarded against silly sizes.
+define desk_rows:
+    set r to screen_rows()
+    if r < 12:
+        return 24
+    return r
+
+### How wide the side panel is (0 means the screen is too narrow for one).
+define panel_width:
+    if desk_columns() < 64:
+        return 0
+    return 26
+
+### How wide the conversation window is.
+define conversation_width:
+    set pw to panel_width()
+    if pw == 0:
+        return desk_columns()
+    return desk_columns() - pw - 2
+
+# ---- The side panel's contents ----
+
+### "at a glance": who, where, how long, how busy.
+define glance_lines with session and services and board:
+    set lines to create_list()
+    set person to session_person(session)
+    set role to session_role(session)
+    set ok to append_list(lines and f"you    {person}")
+    set ok to append_list(lines and f"role   {role}")
+    set ok to append_list(lines and f"place  {vf_shown(session_place(session))}")
+    set up to uptime_seconds()
+    set ok to append_list(lines and f"awake  {up} seconds")
+    set beats to service_ask(services and board and "heartbeat")
+    if beats < 0:
+        set ok to append_list(lines and "beats  (resting)")
+    else:
+        set ok to append_list(lines and f"beats  {beats}")
+    set ok to append_list(lines and f"people {account_count()}")
+    set tally to vf_tally()
+    set notes to get_list(tally and 0)
+    set folders to get_list(tally and 1)
+    set ok to append_list(lines and f"disk   {notes} notes")
+    set ok to append_list(lines and f"       {folders} folders")
+    return lines
+
+### "notes here": what is in the folder you are standing in.
+define here_lines with session:
+    set lines to create_list()
+    set names to vf_names(session and "")
+    if length_list(names) == 0:
+        set ok to append_list(lines and "(nothing here)")
+        return lines
+    for each entry in names:
+        set name to concat(entry and "")
+        if vf_is_folder(session and name) == 1:
+            set ok to append_list(lines and concat(name and "/"))
+        else:
+            set ok to append_list(lines and name)
+    return lines
+
+### "the diary": the last handful of things the system noted.
+define diary_lines with rows_available:
+    set lines to create_list()
+    set recent to recent_log_lines(rows_available)
+    for each entry in recent:
+        set whole to concat(entry and "")
+        # drop the "[timestamp] " so the short line fits the narrow panel
+        set close to string_index_of(whole and "] ")
+        if close >= 0:
+            set whole to substring(whole and close + 2 and string_length(whole) - close - 2)
+        set ok to append_list(lines and whole)
+    if length_list(lines) == 0:
+        set ok to append_list(lines and "(nothing yet)")
+    return lines
+
+### The current panel's lines, whichever it is.
+define current_panel_lines with session and services and board and rows_available:
+    set idx to panel_index()
+    if idx == 1:
+        return here_lines(session)
+    if idx == 2:
+        return diary_lines(rows_available)
+    return glance_lines(session and services and board)
+
+# ---- Turning lists of lines into fixed-height blocks ----
+
+### Exactly `count` lines: the LAST count, blanks padded at the top so the
+### newest sits at the bottom (for the scrolling conversation).
+define block_bottom with lines and count:
+    set out to create_list()
+    set n to length_list(lines)
+    set start to n - count
+    if start < 0:
+        set blanks to count - n
+        set i to 0
+        repeat while i < blanks:
+            set ok to append_list(out and "")
+            set i to i + 1
+        set start to 0
+    set i to start
+    repeat while i < n:
+        set ok to append_list(out and concat(get_list(lines and i) and ""))
+        set i to i + 1
+    return out
+
+### Exactly `count` lines: the FIRST count, blanks padded at the bottom
+### (for the side panel, which reads top-down).
+define block_top with lines and count:
+    set out to create_list()
+    set n to length_list(lines)
+    set i to 0
+    repeat while i < count:
+        if i < n:
+            set ok to append_list(out and concat(get_list(lines and i) and ""))
+        else:
+            set ok to append_list(out and "")
+        set i to i + 1
+    return out
+
+# ---- The bars ----
+
+### The Mac-style menu bar.
+define menu_bar with session:
+    set cols to desk_columns()
+    set left to " Ern-OS     Files    People    Help"
+    set person to session_person(session)
+    set right to concat(clock_time_of_day() and concat("   " and concat(person and " ")))
+    set text to justify(left and right and cols)
+    set out to colour_on(menu_colours())
+    set out to concat(out and text)
+    return concat(out and colour_off())
+
+### The Windows-style taskbar.
+define task_bar with services and board:
+    set cols to desk_columns()
+    set left to " [start]   shell   notes   files   monitor   welcome"
+    set beats to service_ask(services and board and "heartbeat")
+    set right to "heartbeat resting "
+    if beats >= 0:
+        set right to concat("heartbeat: " and concat(int_to_string(beats) and " beats "))
+    set text to justify(left and right and cols)
+    set out to colour_on(taskbar_colours())
+    set out to concat(out and text)
+    return concat(out and colour_off())
+
+# ---- Painting ----
+
+### Repaint only the prompt line — done for every keystroke, so typing is
+### light and never recomputes the panels.
+define paint_prompt with input as Str:
+    set rows to desk_rows()
+    set out to move_to(rows and 1)
+    set out to concat(out and wipe_to_line_end())
+    set out to concat(out and concat(" > " and input))
+    set out to concat(out and show_cursor())
+    return paint(out)
+
+### Repaint the whole desktop from the current state, with `input` sitting
+### at the prompt.
+define paint_desktop with session and services and board and input as Str:
+    set cols to desk_columns()
+    set rows to desk_rows()
+    set convo_w to conversation_width()
+    set panel_w to panel_width()
+    set body_top to 2
+    set body_bottom to rows - 2
+    set content_rows to body_bottom - body_top - 1
+
+    set convo_block to block_bottom(transcript() and content_rows)
+    set panel_block to create_list()
+    if panel_w > 0:
+        set panel_source to current_panel_lines(session and services and board and content_rows)
+        set panel_block to block_top(panel_source and content_rows)
+
+    set out to hide_cursor()
+    set out to concat(out and move_to(1 and 1))
+    set out to concat(out and menu_bar(session))
+
+    set r to body_top
+    repeat while r <= body_bottom:
+        set idx to r - body_top
+        if r == body_top:
+            set left_piece to frame_top("conversation" and convo_w)
+        else:
+            if r == body_bottom:
+                set left_piece to frame_bottom(convo_w)
+            else:
+                set convo_line to concat(get_list(convo_block and idx - 1) and "")
+                set left_piece to frame_row(convo_line and convo_w)
+        set line to left_piece
+        if panel_w > 0:
+            if r == body_top:
+                set right_piece to frame_top(panel_title() and panel_w)
+            else:
+                if r == body_bottom:
+                    set right_piece to frame_bottom(panel_w)
+                else:
+                    set panel_line to concat(get_list(panel_block and idx - 1) and "")
+                    set right_piece to frame_row(panel_line and panel_w)
+            set line to concat(left_piece and concat("  " and right_piece))
+        set out to concat(out and move_to(r and 1))
+        set out to concat(out and line)
+        set r to r + 1
+
+    set out to concat(out and move_to(rows - 1 and 1))
+    set out to concat(out and task_bar(services and board))
+    set out to concat(out and move_to(rows and 1))
+    set out to concat(out and wipe_to_line_end())
+    set out to concat(out and concat(" > " and input))
+    set out to concat(out and show_cursor())
+    return paint(out)
+
+# ---- The prompt: reading a sentence key by key so Tab can flip panels ----
+
+### Read one whole sentence. Printable keys build it (shown as you type),
+### Backspace rubs one out, Tab flips the side panel, Enter finishes.
+define desktop_prompt with session and services and board:
+    set input to ""
+    set ok to paint_desktop(session and services and board and input)
+    repeat while 1 == 1:
+        set key to read_one_key()
+        if key < 0:
+            return input
+        if key == 10 || key == 13:
+            return input
+        if key == 9:
+            set ok to flip_panel()
+            set ok to paint_desktop(session and services and board and input)
+        else:
+            if key == 127 || key == 8:
+                set len to string_length(input)
+                if len > 0:
+                    set input to substring(input and 0 and len - 1)
+                    set ok to paint_prompt(input)
+            else:
+                if key >= 32:
+                    set input to concat(input and char_from_code(key))
+                    set ok to paint_prompt(input)
+    return input
+
+# ---- The loop ----
+
+### Redraw the desktop with an empty prompt — what the terminal calls
+### through its repaint hook when an app asks a question mid-flow.
+define desktop_repaint with session and services and board:
+    return paint_desktop(session and services and board and "")
+
+### Run the desktop until the person logs out (gives back 0) or shuts the
+### system down (gives back 1). Mirrors shell_loop exactly, face aside.
+define desktop_loop with session and services and board:
+    set ok to enter_full_screen()
+    set painter to given ignored:
+        return desktop_repaint(session and services and board)
+    set ok to set_repaint_hook(painter)
+    set ok to say("Welcome to the Ern-OS desktop.")
+    set ok to say("Type a sentence and press Enter. Say 'help' to see them all.")
+    set ok to say("Press Tab to flip the panel on the right.")
+    set ok to say_nothing()
+    repeat while 1 == 1:
+        set line to desktop_prompt(session and services and board)
+        set here to session_place(session)
+        set ok to say(concat(vf_shown(here) and concat(" > " and line)))
+        set cmd to understand_command(line)
+        set signal to perform_command(session and services and board and cmd)
+        if signal == 1:
+            set ok to leave_full_screen()
+            return 0
+        if signal == 2:
+            set ok to leave_full_screen()
+            return 1
+    return 0

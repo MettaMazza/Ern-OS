@@ -81,6 +81,28 @@ Apps run in the foreground, in the same program: opening one hands it
 the conversation until it says done. There is at most one at a time,
 one owner of the terminal, and no way to lose data in a handoff.
 
+### The desktop
+
+| file | its job |
+|---|---|
+| `desktop/screen_painting.ep` | pure string brushes: escape codes, colours, framed-window and bar builders (no printing — all testable) |
+| `desktop/the_desktop.ep` | the layout, the side panels, the key-by-key prompt, and `desktop_loop` |
+
+The desktop is a **face over the same conversation**. Its trick is in the
+terminal HAL: in full-screen mood, `say` no longer prints — it files each
+line into a transcript the desktop paints inside its window. So the shell,
+the parser, `do_command`, and every app run completely unchanged; their
+words simply land in the right place. When an app asks a question from deep
+in the call stack, the terminal fires a **repaint hook** the desktop left
+behind (a closure — the HAL never imports the desktop), so the screen
+refreshes before it waits for the answer. The main prompt reads one key at
+a time (so **Tab** can flip the side panel mid-sentence); app sub-prompts
+read a whole line. Two new HAL verbs, `paint` (draw raw bytes, no newline)
+and `ask_secret` (echo `*`), sit on four runtime builtins added for this —
+`read_key`, `terminal_columns`, `terminal_rows`, `screen_write` — each with
+a native macOS and Windows path. `--plain` turns the whole face off and
+gives the M2 shell.
+
 ## One program, one manifest
 
 The Ernos compiler builds whole programs, and two imports of the same file

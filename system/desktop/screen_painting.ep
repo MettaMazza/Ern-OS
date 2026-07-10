@@ -1,0 +1,135 @@
+# screen_painting — the brushes the desktop paints with.
+#
+# Userland (desktop). Pure string builders: nothing here touches the
+# screen, it only makes the text-with-escape-codes strings the desktop
+# then hands to the terminal's `paint`. Because it is all pure strings,
+# every brush can be checked in a test.
+#
+# Only plain ANSI escape codes and eight colours are used — the same
+# ones macOS Terminal and Windows 10+ terminals both understand.
+
+### The escape lead-in (ESC then '['), the start of every ANSI code.
+define lead_in:
+    return concat(char_from_code(27) and "[")
+
+### Move the cursor to a row and column (both counting from 1).
+define move_to with row and col:
+    set code to concat(lead_in() and int_to_string(row))
+    set code to concat(code and ";")
+    set code to concat(code and int_to_string(col))
+    return concat(code and "H")
+
+### Turn on a colour, given as an SGR code like "44;37" (blue on white).
+define colour_on with code as Str:
+    set out to concat(lead_in() and code)
+    return concat(out and "m")
+
+### Turn all colour and styling back off.
+define colour_off:
+    return concat(lead_in() and "0m")
+
+### Clear the whole screen.
+define wipe:
+    return concat(lead_in() and "2J")
+
+### Clear from the cursor to the end of its line.
+define wipe_to_line_end:
+    return concat(lead_in() and "K")
+
+### Hide the blinking cursor (while painting).
+define hide_cursor:
+    return concat(lead_in() and "?25l")
+
+### Show the blinking cursor (at a prompt).
+define show_cursor:
+    return concat(lead_in() and "?25h")
+
+### The blue of the menu bar: white letters on blue.
+define menu_colours:
+    return "44;37"
+
+### The grey of the taskbar: black letters on white.
+define taskbar_colours:
+    return "47;30"
+
+### Cut or pad a string so it is exactly `width` characters wide.
+define fit with text as Str and width:
+    set s to concat(text and "")
+    set len to string_length(s)
+    if len == width:
+        return s
+    if len > width:
+        return substring(s and 0 and width)
+    set padded to s
+    set i to len
+    repeat while i < width:
+        set padded to concat(padded and " ")
+        set i to i + 1
+    return padded
+
+### Centre a string inside `width` characters.
+define fit_centre with text as Str and width:
+    set s to concat(text and "")
+    set len to string_length(s)
+    if len >= width:
+        return substring(s and 0 and width)
+    set left_pad to (width - len) / 2
+    set out to ""
+    set i to 0
+    repeat while i < left_pad:
+        set out to concat(out and " ")
+        set i to i + 1
+    set out to concat(out and s)
+    return fit(out and width)
+
+### A horizontal run of one character, `width` long — for borders.
+define run_of with ch as Str and width:
+    set out to ""
+    set i to 0
+    repeat while i < width:
+        set out to concat(out and ch)
+        set i to i + 1
+    return out
+
+### Left text and right text justified to the two ends of a bar `width` wide.
+define justify with left as Str and right as Str and width:
+    set l to concat(left and "")
+    set r to concat(right and "")
+    set used to string_length(l) + string_length(r)
+    if used >= width:
+        return fit(concat(l and r) and width)
+    set gap to width - used
+    set middle to run_of(" " and gap)
+    return concat(l and concat(middle and r))
+
+### The top of a framed window: +--[ title ]--------+ , exactly `width` wide.
+define frame_top with title as Str and width:
+    if width < 6:
+        return run_of("+" and width)
+    set label to concat("--[ " and title)
+    set label to concat(label and " ]")
+    set inner to width - 2
+    set label_len to string_length(label)
+    if label_len > inner:
+        set label to substring(label and 0 and inner)
+        set label_len to inner
+    set bar to concat(label and run_of("-" and inner - label_len))
+    set line to concat("+" and bar)
+    return concat(line and "+")
+
+### The bottom of a framed window: +-----------------+
+define frame_bottom with width:
+    if width < 2:
+        return run_of("+" and width)
+    set inner to width - 2
+    set line to concat("+" and run_of("-" and inner))
+    return concat(line and "+")
+
+### One content row of a framed window: | text ... |
+define frame_row with text as Str and width:
+    if width < 2:
+        return run_of(" " and width)
+    set inner to width - 2
+    set body to fit(concat(" " and text) and inner)
+    set line to concat("|" and body)
+    return concat(line and "|")
