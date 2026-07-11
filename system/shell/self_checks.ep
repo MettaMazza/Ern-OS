@@ -1,0 +1,56 @@
+# self_checks — the system proving it is healthy, out loud.
+#
+# Userland. Run when Ern-OS is started with --just-checking (which
+# is how a freshly rebuilt system is examined before it is trusted):
+# no login, no desktop — just exercise the important organs and say
+# either "all is well" or exactly what is wrong. Gives back 0 when
+# everything passed, 1 otherwise.
+
+### One check's verdict, spoken and counted.
+define check_verdict with name as Str and passed:
+    if passed == 1:
+        set ok to say(f"  {name} - fine")
+        return 0
+    set ok to say(f"  {name} - WRONG")
+    return 1
+
+define run_self_checks:
+    set ok to say("Checking myself over...")
+    set bad to 0
+
+    # The disk: write a note, read it back, throw it away.
+    set bad to bad + check_verdict("the disk" and health_probe_disk())
+
+    # The ears: three sentences the shell must always understand.
+    set fine to 1
+    set c1 to understand_command("make a folder called letters")
+    if string_equals(command_action(c1) and "make_folder") == 0:
+        set fine to 0
+    set c2 to understand_command("write a note called hello saying good morning")
+    if string_equals(command_action(c2) and "write") == 0:
+        set fine to 0
+    set c3 to understand_command("shut down")
+    if string_equals(command_action(c3) and "shutdown") == 0:
+        set fine to 0
+    set bad to bad + check_verdict("the ears" and fine)
+
+    # The locks: the password folding must give the exact known answer.
+    set vector to stretch_secret("ernos-self-check-salt" and "ernos-self-check-word")
+    set expected to "9ec9a275175805a4a802d559a0a58079d76a77adcf306cce521b8f76fb74611e"
+    set bad to bad + check_verdict("the locks" and string_equals(vector and expected))
+
+    # The face: the desktop's frames must measure exactly.
+    set frame_fine to 1
+    if string_length(frame_top("check" and 40)) != 40:
+        set frame_fine to 0
+    if string_length(frame_row("check" and 40)) != 40:
+        set frame_fine to 0
+    if string_length(frame_bottom(40)) != 40:
+        set frame_fine to 0
+    set bad to bad + check_verdict("the face" and frame_fine)
+
+    if bad == 0:
+        set ok to say("all is well")
+        return 0
+    set ok to say(f"{bad} of my checks failed - do not trust this build")
+    return 1

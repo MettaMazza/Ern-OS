@@ -176,6 +176,10 @@ define verb_action with w as Str:
         return "start"
     if string_equals(w and "stop") == 1:
         return "stop"
+    if string_equals(w and "rebuild") == 1:
+        return "rebuild"
+    if string_equals(w and "restart") == 1 || string_equals(w and "reboot") == 1:
+        return "restart"
     if string_equals(w and "add") == 1 || string_equals(w and "invite") == 1:
         return "add"
     if string_equals(w and "log") == 1 || string_equals(w and "logout") == 1 || string_equals(w and "sign") == 1:
@@ -268,6 +272,12 @@ define understand_command with line as Str:
         return make_command("logout" and "" and "")
     if string_equals(verb and "shutdown") == 1:
         return make_command("shutdown" and "" and "")
+    if string_equals(verb and "restart") == 1:
+        return make_command("restart" and "" and "")
+    if string_equals(verb and "rebuild") == 1:
+        if index_of_word(words and "toolchain") >= 0 || index_of_word(words and "compiler") >= 0:
+            return make_command("rebuild_toolchain" and "" and "")
+        return make_command("rebuild_system" and "" and "")
 
     # Sentences about people: add a person called finn, list people,
     # remove the person called finn.

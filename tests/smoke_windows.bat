@@ -43,5 +43,25 @@ if not errorlevel 1 (
     echo SMOKE FAIL: a plain password reached the disk
     exit /b 1
 )
-echo SMOKE PASS: Ern-OS built, ran, remembered across a restart, and stored no plain password.
+
+echo [smoke] third boot: the system rebuilds itself ...
+(
+  echo ada
+  echo lovelace
+  echo rebuild the system
+  echo shut down
+) | start_ern_os.exe --plain > tests\smoke3.txt 2>&1
+
+findstr /C:"The new Ern-OS is in place" tests\smoke3.txt >nul
+if errorlevel 1 (
+    echo SMOKE FAIL: the self-rebuild did not finish ^(see tests\smoke3.txt^)
+    exit /b 1
+)
+start_ern_os.exe --just-checking > tests\smoke4.txt 2>&1
+findstr /C:"all is well" tests\smoke4.txt >nul
+if errorlevel 1 (
+    echo SMOKE FAIL: the rebuilt system failed its own checks ^(see tests\smoke4.txt^)
+    exit /b 1
+)
+echo SMOKE PASS: built, remembered across a restart, stored no plain password, and rebuilt itself.
 endlocal

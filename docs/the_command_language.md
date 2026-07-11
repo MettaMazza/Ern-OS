@@ -69,6 +69,17 @@ sentences — the desktop is only the face.
 | `list people` | everyone with an account |
 | `remove the person called finn` | their account goes; their notes stay |
 
+## Rebuilding itself (admins only)
+
+| say | it means |
+|---|---|
+| `rebuild the system` | Ern-OS copies its own source, compiles it with the vendored toolchain, boots the result with `--just-checking` until it says *all is well*, then swaps it in (the old system is kept as `.previous`) |
+| `rebuild the toolchain` (or `the compiler`) | clang re-bakes the vendored Ernos compiler from the frozen bootstrap C, proves it still compiles the system, then swaps it in |
+| `restart` (or `reboot`) | shuts down so the next start boots the new system |
+
+Every step is narrated as it happens and written to the diary. If any step
+fails, the running system is left untouched.
+
 ## About you and the system
 
 | say | it means |

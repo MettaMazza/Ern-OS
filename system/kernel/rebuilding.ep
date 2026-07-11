@@ -1,0 +1,130 @@
+# rebuilding — Ern-OS making a new Ern-OS out of itself.
+#
+# Kernel layer. The self-hosting loop, driven from a sentence: copy the
+# system's own source, compile it with the vendored toolchain, boot the
+# result just to check it, and swap it into place for the next start.
+# Each step is a small function giving back 1 (done) or 0 (stopped), so
+# the shell can narrate between them; every step lands in the diary.
+#
+# The compiler writes its binary next to the source, named after it —
+# so the source is copied to rebuilt_ern_os.ep first: compiling
+# start_ern_os.ep directly would write over the very binary that is
+# running (which Windows refuses, and nobody should do anyway).
+
+### Step 1: copy the system's source to the rebuild name.
+define rebuild_copy_source:
+    set ok to outside_copy("start_ern_os.ep" and "rebuilt_ern_os.ep")
+    if ok == 1:
+        set noted to log_note("rebuild: source copied")
+        return 1
+    set noted to log_problem("rebuild: could not copy the source")
+    return 0
+
+### Step 2: compile the copy with the vendored toolchain.
+define rebuild_compile:
+    if outside_is_windows() == 1:
+        set said to outside_run("toolchain\\epc.exe rebuilt_ern_os.ep 2>&1")
+    else:
+        set said to outside_run("./toolchain/epc rebuilt_ern_os.ep 2>&1")
+    if string_contains(said and "compilation successful") == 1:
+        set noted to log_note("rebuild: compiled")
+        return 1
+    set noted to log_problem("rebuild: the compile failed")
+    return 0
+
+### Step 3: boot the new system just to check it says all is well.
+define rebuild_check:
+    set fresh to runnable_name("rebuilt_ern_os")
+    if outside_is_windows() == 1:
+        set said to outside_run(f"{fresh} --just-checking 2>&1")
+    else:
+        set said to outside_run(f"./{fresh} --just-checking 2>&1")
+    if string_contains(said and "all is well") == 1:
+        set noted to log_note("rebuild: the new system checks out")
+        return 1
+    set noted to log_problem("rebuild: the new system failed its checks")
+    return 0
+
+### Step 4: keep the old system as .previous and put the new one in place.
+define rebuild_swap:
+    set current to runnable_name("start_ern_os")
+    set fresh to runnable_name("rebuilt_ern_os")
+    set kept to outside_move(current and concat(current and ".previous"))
+    if kept == 0:
+        set noted to log_problem("rebuild: could not set the old system aside")
+        return 0
+    set placed to outside_move(fresh and current)
+    if placed == 0:
+        # put the old one back rather than leave no system at all
+        set restored to outside_move(concat(current and ".previous") and current)
+        set noted to log_problem("rebuild: could not put the new system in place")
+        return 0
+    set noted to log_note("rebuild: the new system is in place")
+    return 1
+
+### Step 5: sweep up the source copy. (The generated C stays behind on
+### purpose — the test suite compares it between rebuilds to prove the
+### system rebuilds itself byte-for-byte the same.)
+define rebuild_tidy:
+    set ok to outside_remove("rebuilt_ern_os.ep")
+    return 1
+
+### A health probe for the self-checks: write a note straight to the
+### disk, read it back, throw it away. 1 when the disk tells the truth.
+define health_probe_disk:
+    set prepared to disk_prepare()
+    set wrote to disk_write("self_check_note" and "still breathing")
+    set back to disk_read("self_check_note")
+    set matches to string_equals(back and "still breathing")
+    set removed to disk_remove_file("self_check_note")
+    return matches
+
+# ---- The shorter loop: re-bake the vendored compiler itself ----
+
+### Step 1: clang builds a fresh compiler from the frozen bootstrap C.
+define toolchain_bake:
+    set fresh to runnable_name("epc_next")
+    if outside_is_windows() == 1:
+        set said to outside_run(f"clang -O2 toolchain\\epc_bootstrap.c -o toolchain\\{fresh} && echo TOOLCHAIN_OK")
+    else:
+        set said to outside_run(f"clang -O2 toolchain/epc_bootstrap.c -o toolchain/{fresh} -lpthread && echo TOOLCHAIN_OK")
+    if string_contains(said and "TOOLCHAIN_OK") == 1:
+        set noted to log_note("toolchain: baked fresh from the frozen C")
+        return 1
+    set noted to log_problem("toolchain: clang could not bake it")
+    return 0
+
+### Step 2: prove the fresh compiler still compiles this very system.
+define toolchain_check:
+    set copied to outside_copy("start_ern_os.ep" and "rebuilt_ern_os.ep")
+    if copied == 0:
+        return 0
+    if outside_is_windows() == 1:
+        set said to outside_run("toolchain\\epc_next.exe rebuilt_ern_os.ep 2>&1")
+    else:
+        set said to outside_run("./toolchain/epc_next rebuilt_ern_os.ep 2>&1")
+    if string_contains(said and "compilation successful") == 1:
+        set noted to log_note("toolchain: the fresh compiler compiles the system")
+        return 1
+    set noted to log_problem("toolchain: the fresh compiler failed to compile the system")
+    return 0
+
+### Step 3: put the fresh compiler in place of the old one.
+define toolchain_swap:
+    set current to runnable_name("epc")
+    set fresh to runnable_name("epc_next")
+    if outside_is_windows() == 1:
+        set placed to outside_move(f"toolchain\\{fresh}" and f"toolchain\\{current}")
+    else:
+        set placed to outside_move(f"toolchain/{fresh}" and f"toolchain/{current}")
+    if placed == 1:
+        set noted to log_note("toolchain: the fresh compiler is in place")
+        return 1
+    set noted to log_problem("toolchain: could not put the fresh compiler in place")
+    return 0
+
+### Step 4: sweep up after the toolchain check.
+define toolchain_tidy:
+    set a to outside_remove("rebuilt_ern_os.ep")
+    set b to outside_remove(runnable_name("rebuilt_ern_os"))
+    return 1

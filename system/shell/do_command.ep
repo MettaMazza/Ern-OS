@@ -258,6 +258,65 @@ define perform_command with session and services and board and cmd:
             set ok to say(explain_refusal(answer))
         return 0
 
+    if string_equals(action and "rebuild_system") == 1:
+        if string_equals(role and "admin") == 0:
+            set ok to say("Only an admin may rebuild the system.")
+            return 0
+        set ok to log_note(f"{person} asked for a system rebuild")
+        set ok to say("Rebuilding Ern-OS from its own source...")
+        set ok to say("  copying my source...")
+        if rebuild_copy_source() == 0:
+            set ok to say("I could not copy my own source. Nothing has changed.")
+            return 0
+        set ok to say("  compiling with the vendored toolchain (this takes a moment)...")
+        if rebuild_compile() == 0:
+            set tidied to rebuild_tidy()
+            set ok to say("The compile failed. The running system is untouched.")
+            return 0
+        set ok to say("  booting the new system just to check it...")
+        if rebuild_check() == 0:
+            set tidied to rebuild_tidy()
+            set ok to say("The new system failed its own checks, so I am keeping the old one.")
+            return 0
+        set ok to say("  it says all is well - putting it in place...")
+        if rebuild_swap() == 0:
+            set tidied to rebuild_tidy()
+            set ok to say("I could not swap the new system in. The old one still stands.")
+            return 0
+        set tidied to rebuild_tidy()
+        set ok to say("Done. The new Ern-OS is in place, and the old one is kept as .previous.")
+        set ok to say("Say 'restart' when you are ready.")
+        return 0
+
+    if string_equals(action and "rebuild_toolchain") == 1:
+        if string_equals(role and "admin") == 0:
+            set ok to say("Only an admin may rebuild the toolchain.")
+            return 0
+        set ok to log_note(f"{person} asked for a toolchain rebuild")
+        set ok to say("Re-baking the vendored compiler from its frozen C...")
+        set ok to say("  asking clang to build it...")
+        if toolchain_bake() == 0:
+            set ok to say("clang could not build it - is clang installed? The old compiler still stands.")
+            return 0
+        set ok to say("  proving the fresh compiler still compiles this very system...")
+        if toolchain_check() == 0:
+            set tidied to toolchain_tidy()
+            set ok to say("The fresh compiler failed to compile the system, so I am keeping the old one.")
+            return 0
+        set ok to say("  putting the fresh compiler in place...")
+        if toolchain_swap() == 0:
+            set tidied to toolchain_tidy()
+            set ok to say("I could not swap it in. The old compiler still stands.")
+            return 0
+        set tidied to toolchain_tidy()
+        set ok to say("Done. The toolchain was rebuilt from nothing but clang and the frozen C.")
+        return 0
+
+    if string_equals(action and "restart") == 1:
+        set ok to log_note(f"{person} asked to restart")
+        set ok to say("Going down now. Start me again - the new system will boot.")
+        return 2
+
     if string_equals(action and "logout") == 1:
         set ok to log_note(f"{person} logged out")
         set ok to say(f"Goodbye, {person}.")

@@ -40,4 +40,9 @@ define show_help:
     set ok to say("    help                   - this list")
     set ok to say("    log out                - let someone else use the machine")
     set ok to say("    shut down              - stop Ern-OS")
+    set ok to say("")
+    set ok to say("  Rebuilding itself (admins)")
+    set ok to say("    rebuild the system     - recompile Ern-OS from its own source")
+    set ok to say("    rebuild the toolchain  - re-bake the vendored compiler with clang")
+    set ok to say("    restart                - shut down so the new system boots next")
     return 0

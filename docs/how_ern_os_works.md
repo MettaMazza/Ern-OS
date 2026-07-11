@@ -63,6 +63,23 @@ Passwords are never stored. A record keeps `salt` (16 random bytes) and
 also names its `scheme`, so a stronger scheme can arrive later and old
 records can be migrated at login.
 
+### the self-rebuild
+
+| file | its job |
+|---|---|
+| `hal/outside_programs.ep` | the ONLY place allowed to run host programs (enforced by lint); per-OS copy/move/remove and `.exe` naming |
+| `kernel/rebuilding.ep` | the loop as small steps — copy source, compile, check, swap, tidy — plus the toolchain re-bake; each step logged |
+| `shell/self_checks.ep` | what `--just-checking` runs: the disk, the ears (parser), the locks (a pinned password-folding answer), the face (frame widths) → "all is well" |
+
+`rebuild the system` closes the self-hosting loop from inside: the OS
+compiles a copy of its own source with the vendored toolchain (compiling
+the original name would write over the running binary), boots the result
+headless until it says *all is well*, and only then swaps it in — keeping
+the old binary as `.previous` and restoring it if the swap goes wrong.
+The suite proves the loop every run: two consecutive self-rebuilds must
+emit byte-identical C. `run_command` returns a program's printed output,
+so every step is judged by what it *says* — fittingly for this project.
+
 ### userland — the conversation and the apps
 
 | file | its job |

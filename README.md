@@ -104,9 +104,27 @@ transcript — twice, to prove nothing is forgotten between boots.
 - ~~**M2 — services, apps, people**~~ done.
 - ~~**M3 — the desktop**~~ done: a full-screen terminal desktop, blending
   Mac and Windows, portable to both.
-- **M4 — self-rebuild from within**: say `rebuild the system` inside
-  Ern-OS and it recompiles itself with its own toolchain.
+- ~~**M4 — self-rebuild from within**~~ done: say `rebuild the system` and
+  Ern-OS recompiles itself with its own toolchain, checks the result, and
+  swaps it in — proven byte-identical across generations on every test run.
 - **Phase 2 — bare metal**: see the road map.
+
+## Taking Ern-OS with you
+
+Everything needed travels in this one folder. To hand it to another
+machine (or another person), pack it without your personal disk and the
+built things:
+
+```bash
+tar --exclude='disk' --exclude='start_ern_os' --exclude='start_ern_os.previous' \
+    --exclude='rebuilt_ern_os' --exclude='rebuilt_ern_os.ep' \
+    --exclude='toolchain/epc' --exclude='toolchain/epc_next' --exclude='*_compiled.c' \
+    --exclude='tests/tmp_run' --exclude='.git' -czf ern-os.tar.gz -C .. Ern-OS
+```
+
+On the other machine: unpack, then `bash install.sh` (or `bash install.sh
+--check` to run the whole test suite first). Only clang is needed. On
+Windows: `build_ern_os.bat`, then `tests\smoke_windows.bat` to verify.
 
 ## License
 

@@ -1,0 +1,57 @@
+# outside_programs — the one door to the world outside Ern-OS.
+#
+# This is part of the hardware abstraction layer, and it is the ONLY
+# place in Ern-OS allowed to run a program on the host machine. It
+# exists for exactly one purpose: the self-rebuild — copying the
+# system's own source, running the vendored compiler, checking the
+# result, and swapping it into place. The test suite's lint fails the
+# build if run_command appears anywhere else.
+#
+# run_command gives back what the program PRINTED (not an exit code),
+# so every caller checks for a telltale sentence in the output.
+# (Declared as an external here rather than importing the whole "os"
+# stdlib module, which clashes with "fs" over get_cwd.)
+
+external define ep_run_command with cmd:
+
+### Run a program on the host and give back everything it printed.
+define outside_run with command as Str:
+    set said to ep_run_command(command)
+    return concat(said and "")
+
+### Is the machine underneath us Windows? (Its commands differ.)
+define outside_is_windows:
+    set name to machine_system_name()
+    return string_equals(name and "windows")
+
+### The name a runnable program has here — Windows adds ".exe".
+define runnable_name with stem as Str:
+    if outside_is_windows() == 1:
+        return concat(stem and ".exe")
+    return concat(stem and "")
+
+### Copy a file of the system's own (outside the virtual disk).
+### Gives back 1 when the copy is in place afterwards.
+define outside_copy with from_name as Str and to_name as Str:
+    if outside_is_windows() == 1:
+        set said to outside_run(f"copy /Y {from_name} {to_name} >nul && echo COPY_OK")
+    else:
+        set said to outside_run(f"cp {from_name} {to_name} && echo COPY_OK")
+    return string_contains(said and "COPY_OK")
+
+### Move (rename) a file of the system's own, replacing what was there.
+### Gives back 1 when the move happened.
+define outside_move with from_name as Str and to_name as Str:
+    if outside_is_windows() == 1:
+        set said to outside_run(f"move /Y {from_name} {to_name} >nul && echo MOVE_OK")
+    else:
+        set said to outside_run(f"mv -f {from_name} {to_name} && echo MOVE_OK")
+    return string_contains(said and "MOVE_OK")
+
+### Remove a file of the system's own. Quietly fine if it is not there.
+define outside_remove with name as Str:
+    if outside_is_windows() == 1:
+        set said to outside_run(f"del /Q {name} 2>nul & echo GONE")
+    else:
+        set said to outside_run(f"rm -f {name} && echo GONE")
+    return string_contains(said and "GONE")

@@ -36,6 +36,11 @@ if grep -rnE '^\s*display\b' system/kernel system/shell system/apps system/deskt
     echo "LINT FAIL: something above the hal prints for itself"
     FAIL=1
 fi
+# Host commands may run in exactly ONE file: the hal's outside_programs.
+if grep -rln "run_command" system/ start_ern_os.ep | grep -v "system/hal/outside_programs.ep" ; then
+    echo "LINT FAIL: a host command outside outside_programs.ep"
+    FAIL=1
+fi
 [ "$FAIL" -eq 0 ] && echo "layer rules hold"
 
 echo "== 2. unit tests =="
@@ -129,6 +134,47 @@ else
     echo "DESKTOP FAIL: see $DSK/raw.out"
     FAIL=1
 fi
+
+echo "== 5. the self-rebuild =="
+# The flagship: the OS rebuilds itself from within, twice, and both
+# generations must emit byte-identical C. Rebuild sessions must run at the
+# repo root (the toolchain and source paths live here), so any real disk/
+# is set aside first and put back afterwards, whatever happens.
+RBD=tests/tmp_run/rebuild
+rm -rf "$RBD"
+mkdir -p "$RBD"
+DISK_SAVED=0
+if [ -d disk ]; then mv disk "$RBD/disk_saved"; DISK_SAVED=1; fi
+cp start_ern_os "$RBD/binary_before"
+printf 'rey\nskywalker\nrey\nskywalker\nrebuild the system\nshut down\n' > "$RBD/first.commands"
+printf 'rey\nskywalker\nrebuild the system\nshut down\n' > "$RBD/again.commands"
+rebuild_ok=1
+./start_ern_os --plain < "$RBD/first.commands" > "$RBD/rebuild1.out" 2>&1 || rebuild_ok=0
+grep -q "The new Ern-OS is in place" "$RBD/rebuild1.out" || { echo "  first self-rebuild did not finish"; rebuild_ok=0; }
+if [ "$rebuild_ok" -eq 1 ]; then
+    cp rebuilt_ern_os_compiled.c "$RBD/generation1.c"
+    ./start_ern_os --just-checking > "$RBD/check.out" 2>&1
+    grep -q "all is well" "$RBD/check.out" || { echo "  the rebuilt system failed its own checks"; rebuild_ok=0; }
+fi
+if [ "$rebuild_ok" -eq 1 ]; then
+    ./start_ern_os --plain < "$RBD/again.commands" > "$RBD/rebuild2.out" 2>&1 || rebuild_ok=0
+    grep -q "The new Ern-OS is in place" "$RBD/rebuild2.out" || { echo "  second self-rebuild did not finish"; rebuild_ok=0; }
+fi
+if [ "$rebuild_ok" -eq 1 ]; then
+    if cmp -s "$RBD/generation1.c" rebuilt_ern_os_compiled.c; then
+        echo "PASS: the system rebuilt itself twice, byte-identical both times"
+    else
+        echo "REBUILD FAIL: the two generations differ"
+        rebuild_ok=0
+    fi
+else
+    echo "REBUILD FAIL: see $RBD/"
+fi
+[ "$rebuild_ok" -eq 1 ] || FAIL=1
+# Sweep up and put the world back.
+rm -rf disk
+rm -f start_ern_os.previous rebuilt_ern_os rebuilt_ern_os.ep rebuilt_ern_os_compiled.c
+if [ "$DISK_SAVED" -eq 1 ]; then mv "$RBD/disk_saved" disk; fi
 
 echo "== summary =="
 LINES=$(cat system/hal/*.ep system/kernel/*.ep system/shell/*.ep start_ern_os.ep | wc -l | tr -d ' ')

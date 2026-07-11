@@ -17,6 +17,7 @@ import "system/hal/the_terminal.ep"
 import "system/hal/the_disk.ep"
 import "system/hal/the_clock.ep"
 import "system/hal/the_machine.ep"
+import "system/hal/outside_programs.ep"
 
 import "system/kernel/system_log.ep"
 import "system/kernel/user_accounts.ep"
@@ -24,6 +25,7 @@ import "system/kernel/sessions.ep"
 import "system/kernel/virtual_files.ep"
 import "system/kernel/messages.ep"
 import "system/kernel/services.ep"
+import "system/kernel/rebuilding.ep"
 
 import "system/apps/notes.ep"
 import "system/apps/files.ep"
@@ -35,6 +37,7 @@ import "system/shell/understand_command.ep"
 import "system/shell/help_text.ep"
 import "system/shell/do_command.ep"
 import "system/shell/the_shell.ep"
+import "system/shell/self_checks.ep"
 
 import "system/desktop/screen_painting.ep"
 import "system/desktop/the_desktop.ep"
@@ -67,6 +70,13 @@ define first_boot:
     return 1
 
 define main:
+    # A freshly rebuilt system is examined with --just-checking before it
+    # is trusted: no login, no desktop — run the health checks and stop.
+    if machine_started_with("--just-checking") == 1:
+        set verdict to run_self_checks()
+        set ok to machine_power_off(verdict)
+        return 0
+
     set ok to say("")
     set ok to say("=====================================")
     set ok to say("  Ern-OS")

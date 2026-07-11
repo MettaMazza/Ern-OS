@@ -1,8 +1,15 @@
 # built things
 toolchain/epc
 toolchain/epc.exe
+toolchain/epc_next
+toolchain/epc_next.exe
 start_ern_os
 start_ern_os.exe
+start_ern_os.previous
+start_ern_os.exe.previous
+rebuilt_ern_os
+rebuilt_ern_os.exe
+rebuilt_ern_os.ep
 *_compiled.c
 test_understand_command
 test_user_accounts
@@ -12,6 +19,8 @@ test_screen_painting
 tests/tmp_run/
 tests/smoke1.txt
 tests/smoke2.txt
+tests/smoke3.txt
+tests/smoke4.txt
 
 # the living world of a running Ern-OS (personal data, never committed)
 disk/
