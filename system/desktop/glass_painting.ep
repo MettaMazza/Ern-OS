@@ -1,0 +1,127 @@
+# glass_painting — where the pieces of the graphical desktop sit.
+#
+# Userland (glass desktop). Pure arithmetic and colours: nothing here
+# draws anything, it only works out rectangles and shades so the desktop
+# can place the menu bar, the dock buttons, the conversation window and
+# the text line. Because it is all pure, every measure can be tested.
+
+# ---- The palette (packed the way raylib wants: r + g*256 + b*65536 + 255*16M) ----
+
+define shade with r and g and b:
+    return r + g * 256 + b * 65536 + 255 * 16777216
+
+define colour_desktop:
+    return shade(24 and 44 and 72)
+
+define colour_menu_bar:
+    return shade(18 and 32 and 58)
+
+define colour_taskbar:
+    return shade(14 and 26 and 48)
+
+define colour_window:
+    return shade(248 and 250 and 253)
+
+define colour_window_edge:
+    return shade(70 and 96 and 130)
+
+define colour_ink:
+    return shade(28 and 36 and 52)
+
+define colour_pale_ink:
+    return shade(232 and 238 and 246)
+
+define colour_button:
+    return shade(52 and 88 and 140)
+
+define colour_button_hot:
+    return shade(78 and 124 and 186)
+
+define colour_accent:
+    return shade(240 and 180 and 70)
+
+define colour_input_box:
+    return shade(238 and 242 and 248)
+
+# ---- The bars ----
+
+### How tall the menu bar is.
+define menu_bar_height:
+    return 34
+
+### How tall the dock (button row) is.
+define dock_height:
+    return 44
+
+### The top edge of the dock, given the window height.
+define dock_top with win_h:
+    return win_h - dock_height()
+
+### How tall the text input line is.
+define input_line_height:
+    return 30
+
+### The top edge of the input line (it sits just above the dock).
+define input_line_top with win_h:
+    return dock_top(win_h) - input_line_height()
+
+# ---- The conversation window ----
+
+### The conversation window fills the middle, with a small margin.
+define window_left:
+    return 12
+
+define window_top:
+    return menu_bar_height() + 10
+
+define window_width with win_w:
+    return win_w - 24
+
+define window_height with win_h:
+    return input_line_top(win_h) - window_top() - 8
+
+# ---- The dock buttons ----
+
+### How wide one dock button is.
+define dock_button_width:
+    return 150
+
+### The gap between dock buttons.
+define dock_button_gap:
+    return 8
+
+### The left edge of dock button number `index` (counting from 0).
+define dock_button_x with index:
+    return 12 + index * (dock_button_width() + dock_button_gap())
+
+### The top edge of a dock button.
+define dock_button_y with win_h:
+    return dock_top(win_h) + 7
+
+### How tall a dock button is.
+define dock_button_height:
+    return dock_height() - 14
+
+### Is the point (px, py) inside the rectangle at (x, y, w, h)?
+define inside_rect with px and py and x and y and w and h:
+    if px < x:
+        return 0
+    if px > x + w:
+        return 0
+    if py < y:
+        return 0
+    if py > y + h:
+        return 0
+    return 1
+
+### Which dock button (0-based) is under the point, or -1 if none.
+### `count` is how many buttons there are.
+define dock_button_at with px and py and win_h and count:
+    set i to 0
+    repeat while i < count:
+        set bx to dock_button_x(i)
+        set by to dock_button_y(win_h)
+        if inside_rect(px and py and bx and by and dock_button_width() and dock_button_height()) == 1:
+            return i
+        set i to i + 1
+    return 0 - 1

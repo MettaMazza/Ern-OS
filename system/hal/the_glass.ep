@@ -1,0 +1,137 @@
+# the_glass — the pane Ern-OS draws real pixels on.
+#
+# Part of the hardware abstraction layer, and the ONLY place in Ern-OS
+# allowed to touch the window server. It opens a real window through
+# raylib (loaded at run time) and offers a handful of plain-English
+# brushes — a box, a line of writing, the mouse, the keys. On bare metal
+# this file would be rewritten to drive a framebuffer directly, and the
+# graphical desktop above it would not change a line.
+#
+# raylib is the one optional dependency of the graphical face. If it is
+# not installed, glass_available gives back 0 and Ern-OS falls back to
+# its terminal desktop, which needs nothing at all.
+
+# The glass's memory (a list so it survives across calls):
+#   spot 0  the raylib library handle (0 until loaded, -1 if unavailable)
+#   spot 1  window width
+#   spot 2  window height
+set glass_state to create_list()
+set glass_state_a to append_list(glass_state and 0)
+set glass_state_b to append_list(glass_state and 960)
+set glass_state_c to append_list(glass_state and 620)
+
+### Find raylib on this machine. Gives back 1 if it loaded, 0 if it is
+### not installed. Tries the usual homes on macOS and Linux.
+define glass_load:
+    set handle to ep_dlopen("libraylib.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("/opt/homebrew/lib/libraylib.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("/usr/local/lib/libraylib.dylib")
+    if handle == 0:
+        set handle to ep_dlopen("libraylib.so")
+    if handle == 0:
+        set handle to ep_dlopen("libraylib.so.5")
+    if handle == 0:
+        set handle to ep_dlopen("/usr/lib/libraylib.so")
+    if handle == 0:
+        set ok to set_list(glass_state and 0 and 0 - 1)
+        return 0
+    set ok to set_list(glass_state and 0 and handle)
+    return 1
+
+### Is a real window possible on this machine right now?
+define glass_available:
+    set handle to get_list(glass_state and 0)
+    if handle == 0:
+        return glass_load()
+    if handle == 0 - 1:
+        return 0
+    return 1
+
+### Internal: look up a raylib function by name.
+define glass_fn with name as Str:
+    return ep_dlsym(get_list(glass_state and 0) and name)
+
+### Pack a colour from red, green and blue (0-255), fully opaque —
+### the byte order raylib expects.
+define glass_colour with r and g and b:
+    return r + g * 256 + b * 65536 + 255 * 16777216
+
+# ---- The window ----
+
+### Open the window with a title.
+define glass_open with title as Str:
+    set w to get_list(glass_state and 1)
+    set h to get_list(glass_state and 2)
+    set ok to ep_dlcall3(glass_fn("InitWindow") and w and h and title)
+    set ok to ep_dlcall1(glass_fn("SetTargetFPS") and 30)
+    return 0
+
+### Has the person asked the window to close (the red button, or Cmd-Q)?
+define glass_closing:
+    return ep_dlcall0(glass_fn("WindowShouldClose"))
+
+### Close the window.
+define glass_close:
+    return ep_dlcall0(glass_fn("CloseWindow"))
+
+### How wide and tall the window is.
+define glass_width:
+    return get_list(glass_state and 1)
+
+define glass_height:
+    return get_list(glass_state and 2)
+
+# ---- A frame ----
+
+### Begin painting a fresh frame.
+define glass_begin:
+    return ep_dlcall0(glass_fn("BeginDrawing"))
+
+### Finish the frame and show it.
+define glass_end:
+    return ep_dlcall0(glass_fn("EndDrawing"))
+
+### Flood the whole window with one colour.
+define glass_fill with colour:
+    return ep_dlcall1(glass_fn("ClearBackground") and colour)
+
+### A filled box.
+define glass_box with x and y and w and h and colour:
+    return ep_dlcall5(glass_fn("DrawRectangle") and x and y and w and h and colour)
+
+### The outline of a box.
+define glass_outline with x and y and w and h and colour:
+    return ep_dlcall5(glass_fn("DrawRectangleLines") and x and y and w and h and colour)
+
+### A line of writing.
+define glass_write with text as Str and x and y and size and colour:
+    return ep_dlcall5(glass_fn("DrawText") and text and x and y and size and colour)
+
+### How wide a line of writing would be, in pixels.
+define glass_text_width with text as Str and size:
+    return ep_dlcall2(glass_fn("MeasureText") and text and size)
+
+# ---- The mouse and the keys ----
+
+### Where the mouse pointer is.
+define glass_mouse_x:
+    return ep_dlcall0(glass_fn("GetMouseX"))
+
+define glass_mouse_y:
+    return ep_dlcall0(glass_fn("GetMouseY"))
+
+### Was the left mouse button just clicked this frame?
+define glass_mouse_clicked:
+    return ep_dlcall1(glass_fn("IsMouseButtonPressed") and 0)
+
+### The next letter typed this frame (its character code), or 0 if none.
+### Call repeatedly to drain a fast typist's buffer.
+define glass_typed_letter:
+    return ep_dlcall0(glass_fn("GetCharPressed"))
+
+### The next special key pressed this frame (raylib key code), or 0.
+### Enter is 257, Backspace 259, Tab 258, Escape 256.
+define glass_special_key:
+    return ep_dlcall0(glass_fn("GetKeyPressed"))

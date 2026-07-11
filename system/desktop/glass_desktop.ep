@@ -1,0 +1,235 @@
+# glass_desktop — the graphical face of Ern-OS.
+#
+# Userland. A real window: a menu bar with the clock, a conversation
+# window showing everything the system says, a text line you type
+# sentences into, and a dock of clickable buttons for the apps. It is
+# only a face — every sentence still runs through the very same
+# understand_command and perform_command the terminal shell uses, and
+# the same apps run in it, because the terminal HAL routes their
+# questions to the on-screen text line through the input hook.
+
+# The desktop's memory (a list so it survives across calls):
+#   spot 0  did the person close the window? (0 no, 1 yes)
+#   spot 1  the session in use (0 until someone logs in) — so a question
+#           asked from inside an app draws the right name in the menu bar
+set glass_desk to create_list()
+set glass_desk_init to append_list(glass_desk and 0)
+set glass_desk_init2 to append_list(glass_desk and 0)
+
+define glass_wants_quit:
+    return get_list(glass_desk and 0)
+
+define glass_note_quit:
+    return set_list(glass_desk and 0 and 1)
+
+define glass_set_session with session:
+    return set_list(glass_desk and 1 and session)
+
+### The session to draw with — the signed-in one, or a nobody during login.
+define glass_current_session:
+    set kept to get_list(glass_desk and 1)
+    if kept == 0:
+        return nobody_session()
+    return kept
+
+# ---- The dock ----
+
+define glass_dock_count:
+    return 5
+
+define glass_dock_label with index:
+    if index == 0:
+        return "Notes"
+    if index == 1:
+        return "Files"
+    if index == 2:
+        return "Monitor"
+    if index == 3:
+        return "Welcome"
+    return "Shut down"
+
+define glass_dock_command with index:
+    if index == 0:
+        return "open notes"
+    if index == 1:
+        return "open files"
+    if index == 2:
+        return "open monitor"
+    if index == 3:
+        return "open welcome"
+    return "shut down"
+
+# ---- Drawing one frame ----
+
+### Cut a line of text to at most `max` characters (the window is only
+### so wide; a proper pixel fit would measure, but characters are plenty).
+define glass_clip with text as Str and max:
+    set s to concat(text and "")
+    if string_length(s) > max:
+        return substring(s and 0 and max)
+    return s
+
+### Paint the whole desktop for one frame: menu bar, conversation window
+### with the latest lines, the text line, and the dock.
+define glass_draw with session and services and board and prompt as Str and typed as Str and masked:
+    set w to glass_width()
+    set h to glass_height()
+    set ok to glass_begin()
+    set ok to glass_fill(colour_desktop())
+
+    # Menu bar
+    set ok to glass_box(0 and 0 and w and menu_bar_height() and colour_menu_bar())
+    set ok to glass_write("Ern-OS" and 14 and 8 and 20 and colour_pale_ink())
+    set who to "not signed in"
+    if session_is_real(session) == 1:
+        set who to session_person(session)
+    set right_text to concat(clock_time_of_day() and concat("    " and who))
+    set right_w to glass_text_width(right_text and 18)
+    set ok to glass_write(right_text and w - right_w - 14 and 9 and 18 and colour_pale_ink())
+
+    # Conversation window
+    set wx to window_left()
+    set wy to window_top()
+    set ww to window_width(w)
+    set wh to window_height(h)
+    set ok to glass_box(wx and wy and ww and wh and colour_window())
+    set ok to glass_outline(wx and wy and ww and wh and colour_window_edge())
+    set lines to transcript()
+    set fits to wh / 22
+    set start to length_list(lines) - fits
+    if start < 0:
+        set start to 0
+    set row to 0
+    set i to start
+    repeat while i < length_list(lines):
+        set line to glass_clip(concat(get_list(lines and i) and "") and 96)
+        set ty to wy + 8 + row * 22
+        set ok to glass_write(line and wx + 10 and ty and 18 and colour_ink())
+        set row to row + 1
+        set i to i + 1
+
+    # The text line
+    set ix to window_left()
+    set iy to input_line_top(h)
+    set ok to glass_box(ix and iy and window_width(w) and input_line_height() and colour_input_box())
+    set shown to typed
+    if masked == 1:
+        set shown to ""
+        set mi to 0
+        repeat while mi < string_length(typed):
+            set shown to concat(shown and "*")
+            set mi to mi + 1
+    set line_text to concat(prompt and concat(shown and "_"))
+    set ok to glass_write(glass_clip(line_text and 96) and ix + 8 and iy + 7 and 18 and colour_ink())
+
+    # The dock
+    set ok to glass_box(0 and dock_top(h) and w and dock_height() and colour_taskbar())
+    set mx to glass_mouse_x()
+    set my to glass_mouse_y()
+    set b to 0
+    repeat while b < glass_dock_count():
+        set bx to dock_button_x(b)
+        set by to dock_button_y(h)
+        set bw to dock_button_width()
+        set bh to dock_button_height()
+        set colour to colour_button()
+        if inside_rect(mx and my and bx and by and bw and bh) == 1:
+            set colour to colour_button_hot()
+        set ok to glass_box(bx and by and bw and bh and colour)
+        set label to glass_dock_label(b)
+        set label_w to glass_text_width(label and 18)
+        set ok to glass_write(label and bx + (bw - label_w) / 2 and by + 6 and 18 and colour_pale_ink())
+        set b to b + 1
+
+    set ok to glass_end()
+    return 0
+
+# ---- Reading a line, the graphical way ----
+
+### Run frames until the person presses Enter (gives back the line), or
+### clicks a dock button (gives back its command, when allow_dock is 1),
+### or closes the window (gives back "shut down"). Printable keys build
+### the line, Backspace rubs one out.
+define glass_read_line with session and services and board and prompt as Str and masked and allow_dock:
+    set typed to ""
+    repeat while 1 == 1:
+        if glass_closing() == 1:
+            set ok to glass_note_quit()
+            return "shut down"
+
+        set ch to glass_typed_letter()
+        repeat while ch > 0:
+            if ch >= 32 && ch < 127:
+                set typed to concat(typed and char_from_code(ch))
+            set ch to glass_typed_letter()
+
+        set key to glass_special_key()
+        repeat while key > 0:
+            if key == 257 || key == 335:
+                return typed
+            if key == 259:
+                set len to string_length(typed)
+                if len > 0:
+                    set typed to substring(typed and 0 and len - 1)
+            set key to glass_special_key()
+
+        if allow_dock == 1 && glass_mouse_clicked() == 1:
+            set hit to dock_button_at(glass_mouse_x() and glass_mouse_y() and glass_height() and glass_dock_count())
+            if hit >= 0:
+                return glass_dock_command(hit)
+
+        set ok to glass_draw(session and services and board and prompt and typed and masked)
+    return typed
+
+# ---- The face's life ----
+
+### Run the desktop for one signed-in person. Gives back 0 when they log
+### out, 1 when the system should shut down.
+define glass_session_loop with session and services and board:
+    repeat while 1 == 1:
+        set here to session_place(session)
+        set line to glass_read_line(session and services and board and concat(vf_shown(here) and " > ") and 0 and 1)
+        set ok to say(concat(vf_shown(here) and concat(" > " and line)))
+        set cmd to understand_command(line)
+        set signal to perform_command(session and services and board and cmd)
+        if signal == 1:
+            return 0
+        if signal == 2:
+            return 1
+    return 0
+
+### Open the window, run the login-and-use loop until shutdown, then
+### close it. Gives back 1 (the system is shutting down).
+define run_glass_desktop with services and board and fresh_start:
+    set ok to glass_open("Ern-OS")
+
+    # Questions from deep inside apps come to the on-screen text line.
+    set provider to given request:
+        return glass_read_line(glass_current_session() and services and board and concat(get_list(request and 0) and "") and get_list(request and 1) and 0)
+    set ok to set_input_hook(provider)
+    set ok to begin_capture()
+
+    set ok to say("Welcome to the Ern-OS desktop.")
+    set ok to say("Type a sentence and press Enter, or click a button below.")
+    set ok to say("")
+
+    set first to fresh_start
+    repeat while 1 == 1:
+        set session to login_flow()
+        if glass_wants_quit() == 1:
+            set ok to end_capture()
+            set ok to clear_input_hook()
+            set ok to glass_close()
+            return 1
+        if session_is_real(session) == 1:
+            set ok to glass_set_session(session)
+            if first == 1:
+                set ok to launch_app(session and services and board and "welcome")
+                set first to 0
+            set wants_shutdown to glass_session_loop(session and services and board)
+            if wants_shutdown == 1:
+                set ok to end_capture()
+                set ok to clear_input_hook()
+                set ok to glass_close()
+                return 1
+    return 1

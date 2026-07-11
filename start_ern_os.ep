@@ -18,6 +18,7 @@ import "system/hal/the_disk.ep"
 import "system/hal/the_clock.ep"
 import "system/hal/the_machine.ep"
 import "system/hal/outside_programs.ep"
+import "system/hal/the_glass.ep"
 
 import "system/kernel/system_log.ep"
 import "system/kernel/user_accounts.ep"
@@ -41,6 +42,8 @@ import "system/shell/self_checks.ep"
 
 import "system/desktop/screen_painting.ep"
 import "system/desktop/the_desktop.ep"
+import "system/desktop/glass_painting.ep"
+import "system/desktop/glass_desktop.ep"
 
 ### The very first boot: prepare the disk and meet the first person.
 ### They become the administrator. Gives back 1 so the first login can
@@ -96,24 +99,38 @@ define main:
     set board to create_message_board()
     set ok to service_start(services and board and "heartbeat")
 
-    # The desktop is the face of Ern-OS; --plain gives the sentence-only
-    # shell (and is what the scripted tests drive).
+    # Ern-OS has three faces. The graphical desktop is the default when a
+    # window is possible; --terminal forces the text desktop; --plain gives
+    # the sentence-only shell (which the scripted tests drive).
     set plain to machine_started_with("--plain")
+    set force_terminal to machine_started_with("--terminal")
+    set use_glass to 0
+    if plain == 0 && force_terminal == 0:
+        if glass_available() == 1:
+            set use_glass to 1
 
-    repeat while 1 == 1:
-        set ok to say("")
-        set session to login_flow()
-        if session_is_real(session) == 0:
-            continue
-        if fresh_start == 1:
-            set ok to launch_app(session and services and board and "welcome")
-            set fresh_start to 0
-        if plain == 1:
-            set wants_shutdown to shell_loop(session and services and board)
-        else:
-            set wants_shutdown to desktop_loop(session and services and board)
-        if wants_shutdown == 1:
-            break
+    if use_glass == 1:
+        # The glass desktop runs its own login-and-use loop in the window,
+        # closing it when the person shuts down.
+        set wants_shutdown to run_glass_desktop(services and board and fresh_start)
+    else:
+        if force_terminal == 0:
+            if plain == 0:
+                set ok to say("(No window available, so this is the terminal desktop. Add raylib for the graphical one.)")
+        repeat while 1 == 1:
+            set ok to say("")
+            set session to login_flow()
+            if session_is_real(session) == 0:
+                continue
+            if fresh_start == 1:
+                set ok to launch_app(session and services and board and "welcome")
+                set fresh_start to 0
+            if plain == 1:
+                set wants_shutdown to shell_loop(session and services and board)
+            else:
+                set wants_shutdown to desktop_loop(session and services and board)
+            if wants_shutdown == 1:
+                break
 
     set ok to service_stop(services and board and "heartbeat")
     set ok to say("")

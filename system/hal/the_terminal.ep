@@ -22,6 +22,7 @@ set the_screen to create_list()
 set screen_init_a to append_list(the_screen and 0)
 set screen_init_b to append_list(the_screen and create_list())
 set screen_init_c to append_list(the_screen and create_list())
+set screen_init_d to append_list(the_screen and create_list())
 
 ### Are we painting a full-screen desktop right now?
 define in_full_screen:
@@ -96,12 +97,53 @@ define fire_repaint:
     set painter to get_list(hooks and 0)
     return painter(0)
 
+# ---- The input hook (a graphical face answers questions its own way) ----
+
+### Let a graphical face provide typed lines. The closure is called with a
+### small list [prompt, masked?] and gives back the line the person typed.
+### When one is installed, ask/ask_secret route through it instead of the
+### keyboard, so apps work in a window with no change to their code.
+define set_input_hook with provider:
+    set hooks to get_list(the_screen and 3)
+    if length_list(hooks) == 0:
+        set ok to append_list(hooks and provider)
+    else:
+        set ok to set_list(hooks and 0 and provider)
+    return 0
+
+define clear_input_hook:
+    set empty to create_list()
+    set ok to set_list(the_screen and 3 and empty)
+    return 0
+
+define has_input_hook:
+    set hooks to get_list(the_screen and 3)
+    if length_list(hooks) == 0:
+        return 0
+    return 1
+
+### Ask the installed provider for a line. masked is 1 for a password.
+define fire_input_hook with prompt as Str and masked:
+    set hooks to get_list(the_screen and 3)
+    set provider to get_list(hooks and 0)
+    set request to create_list()
+    set ok to append_list(request and concat(prompt and ""))
+    set ok to append_list(request and masked)
+    set answer to provider(request)
+    return concat(answer and "")
+
 # ---- Asking questions ----
 
 ### Ask a question and wait for a whole typed line. In full-screen mood
 ### the question joins the transcript and the screen is redrawn before we
 ### wait, so the prompt shows inside the window.
 define ask with prompt as Str:
+    if has_input_hook() == 1:
+        set ok to transcript_add(prompt)
+        set answer to fire_input_hook(prompt and 0)
+        set clean to string_trim(concat(answer and ""))
+        set ok to transcript_amend_last(concat(prompt and clean))
+        return clean
     if in_full_screen() == 1:
         set ok to transcript_add(prompt)
         set ok to fire_repaint()
@@ -117,6 +159,17 @@ define ask with prompt as Str:
 ### Backspace rubs one out. Works with typed keys and with piped input
 ### (so tests can drive it), in both moods.
 define ask_secret with prompt as Str:
+    if has_input_hook() == 1:
+        set ok to transcript_add(prompt)
+        set answer to fire_input_hook(prompt and 1)
+        set clean to concat(answer and "")
+        set stars_only to ""
+        set si to 0
+        repeat while si < string_length(clean):
+            set stars_only to concat(stars_only and "*")
+            set si to si + 1
+        set ok to transcript_amend_last(concat(prompt and stars_only))
+        return clean
     if in_full_screen() == 1:
         set ok to transcript_add(prompt)
         set ok to fire_repaint()
@@ -171,6 +224,18 @@ define screen_rows:
 define reset_transcript:
     set fresh to create_list()
     set ok to set_list(the_screen and 1 and fresh)
+    return 0
+
+### Start filing `say` output into the transcript (for a face that paints
+### it itself — the graphical desktop), without any terminal escape codes.
+define begin_capture:
+    set ok to reset_transcript()
+    set ok to set_list(the_screen and 0 and 1)
+    return 0
+
+### Stop filing; `say` prints straight to the screen again.
+define end_capture:
+    set ok to set_list(the_screen and 0 and 0)
     return 0
 
 ### Step into the full-screen desktop: switch to the alternate screen so

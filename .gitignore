@@ -28,3 +28,4 @@ disk/
 # scratch
 *.out
 .DS_Store
+test_glass_painting

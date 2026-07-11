@@ -1,0 +1,41 @@
+# test_glass_painting — do the graphical desktop's pieces sit where they should?
+#
+# Compile and run from the repo root. Pure arithmetic, so no disk or window.
+
+import "string"
+import "../system/desktop/glass_painting.ep"
+
+define expect_number with label as Str and got and wanted:
+    if got == wanted:
+        display concat("PASS: " and label)
+        return 0
+    display concat("FAIL: " and label)
+    display f"  wanted {wanted} but got {got}"
+    return 1
+
+define main:
+    set bad to 0
+
+    # Colours pack the way raylib wants: r + g*256 + b*65536 + 255*16M.
+    set bad to bad + expect_number("red packs" and shade(255 and 0 and 0) and 4278190335)
+    set bad to bad + expect_number("black packs" and shade(0 and 0 and 0) and 4278190080)
+
+    # The bars stack up without overlapping, in a 620-tall window.
+    set bad to bad + expect_number("dock sits at the bottom" and dock_top(620) and 620 - 44)
+    set bad to bad + expect_number("input line sits above the dock" and input_line_top(620) and 620 - 44 - 30)
+    set bad to bad + expect_number("window starts below the menu bar" and window_top() and 44)
+
+    # Dock buttons are laid left to right with a gap.
+    set bad to bad + expect_number("first button x" and dock_button_x(0) and 12)
+    set bad to bad + expect_number("second button x" and dock_button_x(1) and 12 + 150 + 8)
+
+    # Hit-testing a point inside and outside a button.
+    set bx to dock_button_x(2)
+    set by to dock_button_y(620)
+    set bad to bad + expect_number("centre of button 2 hits" and inside_rect(bx + 40 and by + 10 and bx and by and dock_button_width() and dock_button_height()) and 1)
+    set bad to bad + expect_number("far away misses" and inside_rect(5 and 5 and bx and by and dock_button_width() and dock_button_height()) and 0)
+    set bad to bad + expect_number("dock_button_at finds button 2" and dock_button_at(bx + 40 and by + 10 and 620 and 5) and 2)
+    set bad to bad + expect_number("dock_button_at finds none up top" and dock_button_at(50 and 50 and 620 and 5) and 0 - 1)
+
+    display f"RESULT: {bad} failed"
+    return 0

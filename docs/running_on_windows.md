@@ -15,8 +15,10 @@ Windows terminal understands just as macOS Terminal does.
   These render VT escape sequences, which the desktop needs. (On very old
   consoles the escape codes would show as text; use Windows Terminal.)
 
-Nothing else — no Rust, no Visual Studio, no libraries. The runtime uses
-native Win32 threads, so there is no separate thread library to link.
+Nothing else — no Rust, no Visual Studio. The runtime uses native Win32
+threads, so there is no separate thread library to link. The **graphical
+desktop** additionally needs raylib installed (`libraylib.dll` on the
+PATH); without it, Ern-OS runs the terminal desktop, which needs nothing.
 
 ## Build and boot
 

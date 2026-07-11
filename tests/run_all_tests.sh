@@ -41,6 +41,17 @@ if grep -rln "run_command" system/ start_ern_os.ep | grep -v "system/hal/outside
     echo "LINT FAIL: a host command outside outside_programs.ep"
     FAIL=1
 fi
+# The window server is reached only through raw FFI, and that lives in
+# exactly ONE file: the_glass. (The library's name may appear in prose
+# elsewhere; only the actual ep_dlopen/ep_dlsym/ep_dlcall calls are fenced.)
+if grep -rlnE '\bep_dl(open|sym|call)' system/ start_ern_os.ep | grep -v "system/hal/the_glass.ep" ; then
+    echo "LINT FAIL: the window server is touched outside the_glass.ep"
+    FAIL=1
+fi
+if grep -rnE '\bglass_(fn|open|begin|end|fill|box|outline|write|closing|close|mouse|typed|special)\w*\(' system/kernel system/shell system/apps | grep -v "system/desktop" ; then
+    echo "LINT FAIL: a glass brush used below the desktop layer"
+    FAIL=1
+fi
 [ "$FAIL" -eq 0 ] && echo "layer rules hold"
 
 echo "== 2. unit tests =="
@@ -104,15 +115,16 @@ else
     echo "PASS: no plain password on the disk"
 fi
 
-echo "== 4. the desktop =="
-# The desktop draws escape codes and live figures, so it cannot be diffed
-# byte for byte. Instead: boot the real desktop over a pipe and prove the
-# frame is there, a command runs inside it, and the terminal is left clean.
+echo "== 4. the terminal desktop =="
+# The terminal desktop draws escape codes and live figures, so it cannot be
+# diffed byte for byte. Instead: boot it over a pipe (--terminal, since the
+# graphical face is now the default) and prove the frame is there, a command
+# runs inside it, and the terminal is left clean.
 DSK=tests/tmp_run/desktop
 rm -rf "$DSK"
 mkdir -p "$DSK"
 printf 'ada\nlovelace\nada\nlovelace\nwhat is running\n\topen files\ndone\nshut down\n' > "$DSK/keys.txt"
-( cd "$DSK" && ../../../start_ern_os < ../../tmp_run/desktop/keys.txt ) > "$DSK/raw.out" 2>&1
+( cd "$DSK" && ../../../start_ern_os --terminal < ../../tmp_run/desktop/keys.txt ) > "$DSK/raw.out" 2>&1
 desk_rc=$?
 strip_ansi() { sed $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g' "$1"; }
 strip_ansi "$DSK/raw.out" > "$DSK/text.out"
@@ -132,6 +144,29 @@ if [ "$desk_ok" -eq 1 ]; then
     echo "PASS: the desktop boots, runs a command in-window, and restores the terminal"
 else
     echo "DESKTOP FAIL: see $DSK/raw.out"
+    FAIL=1
+fi
+
+echo "== 4b. the glass desktop =="
+# A real window can't open in a headless test, so we can't drive the pixels
+# here (that is verified by running it on a Mac). What we CAN prove: the
+# glass modules compile, and that adding the graphical face did not break
+# the text faces — the same binary still serves --plain, --terminal and
+# --just-checking. (Sections 3 and 4 already exercised --plain/--terminal;
+# this asserts the graphical build carries them.)
+if ./toolchain/epc tests/test_glass_painting.ep > tests/tmp_run/glass.build.log 2>&1; then
+    echo "PASS: glass painting compiles and its layout tests ran (section 2)"
+else
+    echo "GLASS FAIL: glass painting did not compile"
+    FAIL=1
+fi
+rm -rf tests/tmp_run/glass_boot
+mkdir -p tests/tmp_run/glass_boot
+( cd tests/tmp_run/glass_boot && ../../../start_ern_os --just-checking > jc.out 2>&1 )
+if grep -q "all is well" tests/tmp_run/glass_boot/jc.out; then
+    echo "PASS: the graphical build still self-checks (--just-checking)"
+else
+    echo "GLASS FAIL: --just-checking broke in the graphical build"
     FAIL=1
 fi
 

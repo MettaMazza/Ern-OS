@@ -63,6 +63,25 @@ Passwords are never stored. A record keeps `salt` (16 random bytes) and
 also names its `scheme`, so a stronger scheme can arrive later and old
 records can be migrated at login.
 
+### the glass (graphical) desktop
+
+| file | its job |
+|---|---|
+| `hal/the_glass.ep` | the ONLY window-server touchpoint: raylib loaded at run time, wrapped in plain-English brushes (a box, a line of writing, the mouse, the keys) |
+| `desktop/glass_painting.ep` | pure layout: bar heights, dock-button rectangles, hit-testing, the colour palette — all testable |
+| `desktop/glass_desktop.ep` | the frame loop: menu bar, conversation window, text line, dock; graphical login; runs sentences through the same perform_command |
+
+The graphical face reuses everything the terminal face built. `say` still
+files output into the transcript (capture mode); the glass paints that
+transcript in a window each frame. Apps ask for input through a second
+hook beside M3's repaint hook — an **input hook**: `ask`/`ask_secret`, when
+one is installed, pull the typed line from the on-screen text line instead
+of the keyboard, so notes/files/monitor run in the window **unchanged**.
+raylib is the one optional dependency; the boot picks the graphical face
+only when `glass_available` says a window is possible, and falls back to
+the terminal desktop otherwise. On bare metal (Phase 2) this file would
+drive a framebuffer instead — the desktop above it wouldn't change.
+
 ### the self-rebuild
 
 | file | its job |

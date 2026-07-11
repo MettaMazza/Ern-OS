@@ -36,21 +36,26 @@ good morning world
 You need a C compiler (clang) — nothing else.
 
 ```bash
-bash build_ern_os.sh    # builds the vendored Ernos compiler, then the OS
-./start_ern_os          # boots into the desktop
-./start_ern_os --plain  # or the sentence-only shell
+bash build_ern_os.sh      # builds the vendored Ernos compiler, then the OS
+./start_ern_os            # boots into the graphical desktop (needs raylib)
+./start_ern_os --terminal # a full-screen text desktop (no libraries)
+./start_ern_os --plain    # or the sentence-only shell
 ```
 
-On Windows it is the same, with clang and a Windows 10+ terminal —
-`build_ern_os.bat` then `start_ern_os.exe`. See
-[docs/running_on_windows.md](docs/running_on_windows.md).
+For the graphical desktop, install raylib once: `brew install raylib` (or
+your package manager). Without it, Ern-OS falls back to the terminal
+desktop automatically — that face needs nothing at all. On Windows it is
+the same, with clang and a Windows 10+ terminal — `build_ern_os.bat` then
+`start_ern_os.exe`. See [docs/running_on_windows.md](docs/running_on_windows.md).
 
 The first boot prepares the disk and asks you to become the administrator.
-Every later boot goes straight to the login. Ern-OS opens a full-screen
-desktop — a Mac-style menu bar up top, a Windows-style taskbar below, your
-conversation and a live panel side by side; **Tab** flips the panel, and
-passwords show as `*`. Say `help` inside to see everything Ern-OS
-understands, or read [docs/the_command_language.md](docs/the_command_language.md).
+The **graphical desktop** is a real window: a menu bar with the clock, a
+conversation window, a text line you type sentences into, and a dock of
+clickable app buttons. The **terminal desktop** is the same idea drawn in
+text — a Mac-style menu bar, a live side panel (Tab flips it), a
+Windows-style taskbar. Every face runs the very same plain-English
+commands. Say `help` inside, or read
+[docs/the_command_language.md](docs/the_command_language.md).
 
 ## What it is
 
@@ -107,6 +112,9 @@ transcript — twice, to prove nothing is forgotten between boots.
 - ~~**M4 — self-rebuild from within**~~ done: say `rebuild the system` and
   Ern-OS recompiles itself with its own toolchain, checks the result, and
   swaps it in — proven byte-identical across generations on every test run.
+- ~~**M5 — a real graphical desktop**~~ done: a raylib window with a mouse,
+  a dock of clickable apps, and a text line — the same conversation, in
+  pixels. The terminal desktop and plain shell remain (they need nothing).
 - **Phase 2 — bare metal**: see the road map.
 
 ## Taking Ern-OS with you
