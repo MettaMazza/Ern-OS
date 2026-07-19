@@ -11,7 +11,8 @@ define login_flow:
     set name to ask("Who are you? ")
     if account_exists(name) == 0:
         set ok to say(f"I do not know anyone called '{name}'.")
-        set ok to log_warning(f"login attempt for unknown name {name}")
+        set ok to log_warning_checked(f"login attempt for unknown name {name}")
+        set waited to wait_milliseconds(750)
         return failed
     set tries to 0
     repeat while tries < 3:
@@ -19,14 +20,15 @@ define login_flow:
         if verify_login(name and password) == 1:
             set role to account_role(name)
             set session to begin_session(name and role)
-            set ok to log_note(f"{name} logged in")
+            set ok to log_note_checked(f"{name} logged in")
             set ok to say(f"Welcome back, {name}.")
             return session
         set tries to tries + 1
+        set waited to wait_milliseconds(tries * 750)
         if tries < 3:
             set ok to say("That is not the right password. Try again.")
     set ok to say("Three wrong passwords. Let us start over.")
-    set ok to log_warning(f"three failed passwords for {name}")
+    set ok to log_warning_checked(f"three failed passwords for {name}")
     return failed
 
 ### The conversation loop. Gives back 1 when the person asked to

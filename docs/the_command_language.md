@@ -50,10 +50,10 @@ Inside **files**: say a door number to open it, or `up`, `home`, `done`.
 
 Ern-OS has three faces onto the very same conversation:
 
-- **The graphical desktop** (the default): a real window with a menu bar
-  (clock, who's signed in), a conversation window, a text line you type
-  sentences into, and a **dock of clickable buttons** for the apps. Click a
-  button or type a sentence — both run the same commands. Needs raylib
+- **The graphical desktop** (the default): a real window with a Mac-like
+  global menu and window chrome, a Windows-like Start/taskbar, a live system
+  sidebar, a conversation, and clickable app buttons. Click a button or type
+  a sentence — both run the same commands. Needs raylib
   installed (`brew install raylib`); without it, Ern-OS falls back to the
   terminal desktop automatically.
 - **The terminal desktop** (`--terminal`): a full-screen text desktop drawn
@@ -102,9 +102,10 @@ fails, the running system is left untouched.
 - Everyone's actions are written to the system diary at
   `/system/log/system.log`.
 
-## Known small print (M1)
+## Current limits
 
-- Passwords are typed in the open at the prompt (no hidden input yet).
+- Passwords must contain at least eight characters. They are masked in every
+  face and are never written to disk.
 - Names lose padding words: a folder cannot be called "my letters" —
   the "my" is treated as padding.
 - Text is ASCII for now; accented letters are politely refused in names.

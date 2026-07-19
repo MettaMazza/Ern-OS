@@ -108,7 +108,7 @@ else
     echo "E2E FAIL: the note did not survive a restart"
     FAIL=1
 fi
-if grep -rq "sunrise" "$E2E/disk" || grep -rq "tide42" "tests/tmp_run/e2e_full_tour/disk"; then
+if grep -rq "sunrise8" "$E2E/disk" || grep -rq "tide42safe" "tests/tmp_run/e2e_full_tour/disk"; then
     echo "E2E FAIL: a plain password reached the disk"
     FAIL=1
 else
@@ -172,31 +172,31 @@ fi
 
 echo "== 5. the self-rebuild =="
 # The flagship: the OS rebuilds itself from within, twice, and both
-# generations must emit byte-identical C. Rebuild sessions must run at the
-# repo root (the toolchain and source paths live here), so any real disk/
-# is set aside first and put back afterwards, whatever happens.
+# generations must emit byte-identical C. It runs in a complete isolated
+# copy so a developer's binary and personal disk are never touched.
 RBD=tests/tmp_run/rebuild
 rm -rf "$RBD"
-mkdir -p "$RBD"
-DISK_SAVED=0
-if [ -d disk ]; then mv disk "$RBD/disk_saved"; DISK_SAVED=1; fi
-cp start_ern_os "$RBD/binary_before"
+WORK="$RBD/worktree"
+mkdir -p "$WORK/toolchain"
+cp -R system stdlib "$WORK/"
+cp toolchain/epc toolchain/epc_bootstrap.c "$WORK/toolchain/"
+cp start_ern_os start_ern_os.ep "$WORK/"
 printf 'rey\nskywalker\nrey\nskywalker\nrebuild the system\nshut down\n' > "$RBD/first.commands"
 printf 'rey\nskywalker\nrebuild the system\nshut down\n' > "$RBD/again.commands"
 rebuild_ok=1
-./start_ern_os --plain < "$RBD/first.commands" > "$RBD/rebuild1.out" 2>&1 || rebuild_ok=0
+( cd "$WORK" && ./start_ern_os --plain < ../first.commands ) > "$RBD/rebuild1.out" 2>&1 || rebuild_ok=0
 grep -q "The new Ern-OS is in place" "$RBD/rebuild1.out" || { echo "  first self-rebuild did not finish"; rebuild_ok=0; }
 if [ "$rebuild_ok" -eq 1 ]; then
-    cp rebuilt_ern_os_compiled.c "$RBD/generation1.c"
-    ./start_ern_os --just-checking > "$RBD/check.out" 2>&1
+    cp "$WORK/rebuilt_ern_os_compiled.c" "$RBD/generation1.c"
+    ( cd "$WORK" && ./start_ern_os --just-checking ) > "$RBD/check.out" 2>&1
     grep -q "all is well" "$RBD/check.out" || { echo "  the rebuilt system failed its own checks"; rebuild_ok=0; }
 fi
 if [ "$rebuild_ok" -eq 1 ]; then
-    ./start_ern_os --plain < "$RBD/again.commands" > "$RBD/rebuild2.out" 2>&1 || rebuild_ok=0
+    ( cd "$WORK" && ./start_ern_os --plain < ../again.commands ) > "$RBD/rebuild2.out" 2>&1 || rebuild_ok=0
     grep -q "The new Ern-OS is in place" "$RBD/rebuild2.out" || { echo "  second self-rebuild did not finish"; rebuild_ok=0; }
 fi
 if [ "$rebuild_ok" -eq 1 ]; then
-    if cmp -s "$RBD/generation1.c" rebuilt_ern_os_compiled.c; then
+    if cmp -s "$RBD/generation1.c" "$WORK/rebuilt_ern_os_compiled.c"; then
         echo "PASS: the system rebuilt itself twice, byte-identical both times"
     else
         echo "REBUILD FAIL: the two generations differ"
@@ -206,13 +206,25 @@ else
     echo "REBUILD FAIL: see $RBD/"
 fi
 [ "$rebuild_ok" -eq 1 ] || FAIL=1
-# Sweep up and put the world back.
-rm -rf disk
-rm -f start_ern_os.previous rebuilt_ern_os rebuilt_ern_os.ep rebuilt_ern_os_compiled.c
-if [ "$DISK_SAVED" -eq 1 ]; then mv "$RBD/disk_saved" disk; fi
+
+echo "== 6. the bare-metal bootstrap =="
+if bash build_baremetal.sh --objects-only > tests/tmp_run/baremetal.build.log 2>&1; then
+    payload=baremetal/build/x86_64/hello_freestanding.c
+    if grep -q "long long ern_freestanding_program(void)" "$payload" \
+        && grep -q "the real language crossed the hardware boundary" "$payload" \
+        && ! grep -Eiq '#include <(stdio|stdlib|string|pthread|unistd|windows)\.h>|(fopen|system|pthread_create|CreateThread|int main)[[:space:]]*\(' "$payload"; then
+        echo "PASS: the Ernos frontend emits a host-free x86_64 kernel payload"
+    else
+        echo "BARE-METAL CODEGEN FAIL: generated payload crossed the host boundary"
+        FAIL=1
+    fi
+else
+    echo "BARE-METAL BUILD FAIL: see tests/tmp_run/baremetal.build.log"
+    FAIL=1
+fi
 
 echo "== summary =="
-LINES=$(cat system/hal/*.ep system/kernel/*.ep system/shell/*.ep start_ern_os.ep | wc -l | tr -d ' ')
+LINES=$(cat system/hal/*.ep system/kernel/*.ep system/shell/*.ep system/apps/*.ep system/desktop/*.ep start_ern_os.ep | wc -l | tr -d ' ')
 echo "Ern-OS is $LINES lines of Ernos."
 if [ "$FAIL" -eq 0 ]; then
     echo "ALL TESTS PASS"

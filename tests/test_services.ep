@@ -66,10 +66,10 @@ define main:
     # THE regression: hashing on the main thread while a service thread
     # is alive. This exact mix used to segfault the whole system (GC bug,
     # fixed in the language runtime; kept here so it can never sneak back).
-    set made to create_account("maria" and "sunrise" and "admin")
+    set made to create_account("maria" and "sunrise8" and "admin")
     set bad to bad + expect_number("account created under live heartbeat" and made and 1)
     set bad to bad + expect_number("wrong password refused under live heartbeat" and verify_login("maria" and "moonset") and 0)
-    set bad to bad + expect_number("right password welcomed under live heartbeat" and verify_login("maria" and "sunrise") and 1)
+    set bad to bad + expect_number("right password welcomed under live heartbeat" and verify_login("maria" and "sunrise8") and 1)
     set still_beating to service_ask(services and board and "heartbeat")
     if still_beating > later_ask:
         display "PASS: the heartbeat kept beating through it all"

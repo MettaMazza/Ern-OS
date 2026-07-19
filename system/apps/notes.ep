@@ -41,6 +41,8 @@ define edit_note with session and name as Str:
     set unsaved to 0
     repeat while 1 == 1:
         set raw to ask("  line> ")
+        if conversation_shutdown_requested() == 1:
+            return 0
         set lowered to string_to_lower(concat(raw and ""))
         set words to split_into_words(lowered)
         set first to word_at(words and 0)
@@ -122,6 +124,8 @@ define run_notes with session:
     set ok to say("Say: list, edit <name>, or done.")
     repeat while 1 == 1:
         set raw to ask("notes> ")
+        if conversation_shutdown_requested() == 1:
+            return 0
         set lowered to string_to_lower(concat(raw and ""))
         set words to split_into_words(lowered)
         set first to word_at(words and 0)

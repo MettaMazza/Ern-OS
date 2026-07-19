@@ -30,6 +30,8 @@ define run_files with session:
     set names to show_doors(session)
     repeat while 1 == 1:
         set raw to ask("files> ")
+        if conversation_shutdown_requested() == 1:
+            return 0
         set lowered to string_to_lower(concat(raw and ""))
         set words to split_into_words(lowered)
         set first to word_at(words and 0)

@@ -23,7 +23,11 @@ set glass_state_c to append_list(glass_state and 620)
 ### Find raylib on this machine. Gives back 1 if it loaded, 0 if it is
 ### not installed. Tries the usual homes on macOS and Linux.
 define glass_load:
-    set handle to ep_dlopen("libraylib.dylib")
+    set handle to ep_dlopen("raylib.dll")
+    if handle == 0:
+        set handle to ep_dlopen("libraylib.dll")
+    if handle == 0:
+        set handle to ep_dlopen("libraylib.dylib")
     if handle == 0:
         set handle to ep_dlopen("/opt/homebrew/lib/libraylib.dylib")
     if handle == 0:

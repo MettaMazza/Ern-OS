@@ -9,6 +9,7 @@
 #   1 = it worked        2 = not allowed for this person
 #   3 = that name will not do    4 = there is no such thing
 #   5 = the folder is not empty  6 = there is already one
+#   7 = the host storage refused or failed the operation
 
 ### Turn what a person typed into a full virtual path.
 ### "letters" while standing in home/maria becomes home/maria/letters;
@@ -88,7 +89,8 @@ define vf_write with session and raw as Str and text as Str:
             return 4
     if disk_is_folder(path) == 1:
         return 6
-    set ok to disk_write(path and text)
+    if disk_write(path and text) == 0:
+        return 7
     return 1
 
 ### Make a new folder.
@@ -104,7 +106,8 @@ define vf_make_folder with session and raw as Str:
     if string_length(parent) > 0:
         if disk_is_folder(parent) == 0:
             return 4
-    set ok to disk_make_folder(path)
+    if disk_make_folder(path) == 0:
+        return 7
     return 1
 
 ### Remove a note or an empty folder.
@@ -120,9 +123,11 @@ define vf_remove with session and raw as Str:
         set inside to disk_list(path)
         if length_list(inside) > 0:
             return 5
-        set ok to disk_remove_folder(path)
+        if disk_remove_folder(path) == 0:
+            return 7
         return 1
-    set ok to disk_remove_file(path)
+    if disk_remove_file(path) == 0:
+        return 7
     return 1
 
 ### Move or rename something.
@@ -141,7 +146,12 @@ define vf_move with session and raw_from as Str and raw_to as Str:
         return 2
     if disk_exists(to_path) == 1:
         return 6
-    set ok to disk_rename(from_path and to_path)
+    set parent to vf_parent(to_path)
+    if string_length(parent) > 0:
+        if disk_is_folder(parent) == 0:
+            return 4
+    if disk_rename(from_path and to_path) == 0:
+        return 7
     return 1
 
 ### Step into a folder. Gives back 1 when the session has moved.
@@ -203,13 +213,26 @@ define vf_tally:
 define vf_disk_is_formatted:
     return disk_exists("system/registry/users")
 
+### Make sure a required system folder exists and is truly a folder.
+define vf_ensure_folder with path as Str:
+    if disk_exists(path) == 1:
+        return disk_is_folder(path)
+    return disk_make_folder(path)
+
 ### Prepare a brand new disk: the folders every Ern-OS needs.
 define vf_format_disk:
-    set ok to disk_prepare()
-    set ok to disk_make_folder("home")
-    set ok to disk_make_folder("system")
-    set ok to disk_make_folder("system/registry")
-    set ok to disk_make_folder("system/registry/users")
-    set ok to disk_make_folder("system/log")
-    set ok to disk_make_folder("apps")
+    if disk_prepare() == 0:
+        return 0
+    if vf_ensure_folder("home") == 0:
+        return 0
+    if vf_ensure_folder("system") == 0:
+        return 0
+    if vf_ensure_folder("system/registry") == 0:
+        return 0
+    if vf_ensure_folder("system/registry/users") == 0:
+        return 0
+    if vf_ensure_folder("system/log") == 0:
+        return 0
+    if vf_ensure_folder("apps") == 0:
+        return 0
     return 1

@@ -50,7 +50,9 @@ import "system/desktop/glass_desktop.ep"
 ### open the welcome tour.
 define first_boot:
     set ok to say("This looks like the very first start, so let me prepare the disk...")
-    set ok to vf_format_disk()
+    if vf_format_disk() == 0:
+        set ok to say("I could not prepare the disk. Nothing was changed safely; check the folder permissions and try again.")
+        return 0
     set ok to say("The disk is ready.")
     set ok to say("")
     set ok to say("Ern-OS needs to know one person before we begin - you.")
@@ -60,14 +62,14 @@ define first_boot:
         if account_name_is_ok(name) == 0:
             set ok to say("That name will not do - letters, digits, dashes and underscores only.")
             continue
-        set password to ask_secret("Choose a password (at least 4 characters): ")
-        if string_length(password) < 4:
+        set password to ask_secret("Choose a password (at least 8 characters):")
+        if string_length(password) < minimum_password_length():
             set ok to say("That password is too short.")
             continue
         set made to create_account(name and password and "admin")
         if made == 1:
             set ok to say(f"Pleased to meet you, {name}. Your home is /home/{name}.")
-            set ok to log_note(f"first boot: administrator {name} created")
+            set ok to log_note_checked(f"first boot: administrator {name} created")
             return 1
         set ok to say("Something went wrong making your account. Let us try again.")
     return 1
@@ -92,8 +94,12 @@ define main:
     set fresh_start to 0
     if vf_disk_is_formatted() == 0:
         set fresh_start to first_boot()
-    set ok to record_boot_moment()
-    set ok to log_note("system booted")
+        if fresh_start == 0:
+            set ok to machine_power_off(1)
+            return 1
+    if record_boot_moment() == 0:
+        set ok to say("(Warning: the boot moment could not be recorded.)")
+    set ok to log_note_checked("system booted")
 
     set services to create_service_table()
     set board to create_message_board()
@@ -135,6 +141,6 @@ define main:
     set ok to service_stop(services and board and "heartbeat")
     set ok to say("")
     set ok to say("Ern-OS is going to sleep. Goodbye.")
-    set ok to log_note("system shut down")
+    set ok to log_note_checked("system shut down")
     set ok to machine_power_off(0)
     return 0

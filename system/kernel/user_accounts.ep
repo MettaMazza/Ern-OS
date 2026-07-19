@@ -4,10 +4,17 @@
 # plain English lines, at system/registry/users/<name>. Passwords are
 # never stored — only a salted, well-stretched fingerprint of them.
 
-### How many times a password is folded through SHA-256 before storing.
-### More folds make guessing attacks slower.
+### New records use a versioned, salted SHA-256 stretching scheme. The
+### rounds stored in each record are authoritative, so future changes do not
+### lock old accounts out. Legacy records are upgraded after a good login.
 define stretch_rounds:
-    return 100000
+    return 200000
+
+define current_password_scheme:
+    return "ernos-stretched-sha256-v2"
+
+define minimum_password_length:
+    return 8
 
 ### Where a person's record file lives on the disk.
 define account_record_path with name as Str:
@@ -53,16 +60,50 @@ define make_salt:
         set salt to concat(salt and piece)
     return salt
 
-### Turn a salt and a password into the stored fingerprint:
-### fold SHA-256 over it many times.
-define stretch_secret with salt as Str and password as Str:
+### The original M1 scheme, retained only to verify and migrate old records.
+define legacy_stretch_secret with salt as Str and password as Str and rounds:
     set mixed to concat(salt and password)
     set fingerprint to concat(crypto_sha256(mixed) and "")
     set i to 0
-    repeat while i < stretch_rounds():
+    repeat while i < rounds:
         set fingerprint to concat(crypto_sha256(fingerprint) and "")
         set i to i + 1
     return fingerprint
+
+### The current scheme binds the salt into every round and separates its
+### inputs with labels. This remains self-contained in the Ernos runtime.
+define stretch_secret_rounds with salt as Str and password as Str and rounds:
+    set mixed to concat("ern-os-v2|" and salt)
+    set mixed to concat(mixed and "|")
+    set mixed to concat(mixed and password)
+    set fingerprint to concat(crypto_sha256(mixed) and "")
+    set i to 0
+    repeat while i < rounds:
+        set folded to concat(salt and "|")
+        set folded to concat(folded and fingerprint)
+        set fingerprint to concat(crypto_sha256(folded) and "")
+        set i to i + 1
+    return fingerprint
+
+define stretch_secret with salt as Str and password as Str:
+    return stretch_secret_rounds(salt and password and stretch_rounds())
+
+### Compare two fingerprints without revealing the first different position.
+define secrets_match with left as Str and right as Str:
+    set left_len to string_length(left)
+    set right_len to string_length(right)
+    set same to 1
+    if left_len != right_len:
+        set same to 0
+    set count to left_len
+    if right_len < count:
+        set count to right_len
+    set i to 0
+    repeat while i < count:
+        if get_character(left and i) != get_character(right and i):
+            set same to 0
+        set i to i + 1
+    return same
 
 ### Read one "key is value" line out of a record.
 define record_field with content as Str and key as Str:
@@ -77,6 +118,24 @@ define record_field with content as Str and key as Str:
             return concat(value and "")
     return ""
 
+### Build and atomically store a complete account record.
+define write_account_record with name as Str and salt as Str and secret as Str and rounds and scheme as Str and role as Str and created as Str:
+    set record to f"name is {name}"
+    set record to concat(record and "\n")
+    set record to concat(record and f"salt is {salt}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"secret is {secret}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"rounds is {rounds}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"scheme is {scheme}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"role is {role}")
+    set record to concat(record and "\n")
+    set record to concat(record and f"created is {created}")
+    set record to concat(record and "\n")
+    return disk_write(account_record_path(name) and record)
+
 ### Create a new person: write their record and make their home folder.
 ### role is "admin" or "member". Gives back 1 when it worked.
 define create_account with name as Str and password as Str and role as Str:
@@ -84,31 +143,22 @@ define create_account with name as Str and password as Str and role as Str:
         return 0
     if account_exists(name) == 1:
         return 0
-    if string_length(password) < 4:
+    if string_length(password) < minimum_password_length():
+        return 0
+    if string_equals(role and "admin") == 0 && string_equals(role and "member") == 0:
         return 0
     set salt to make_salt()
     set secret to stretch_secret(salt and password)
     set stamp to clock_stamp()
-    set record to f"name is {name}"
-    set record to concat(record and "\n")
-    set record to concat(record and f"salt is {salt}")
-    set record to concat(record and "\n")
-    set record to concat(record and f"secret is {secret}")
-    set record to concat(record and "\n")
-    set record to concat(record and f"rounds is {stretch_rounds()}")
-    set record to concat(record and "\n")
-    set record to concat(record and "scheme is stretched-sha256")
-    set record to concat(record and "\n")
-    set record to concat(record and f"role is {role}")
-    set record to concat(record and "\n")
-    set record to concat(record and f"created is {stamp}")
-    set record to concat(record and "\n")
     set record_path to account_record_path(name)
-    set ok to disk_write(record_path and record)
+    if write_account_record(name and salt and secret and stretch_rounds() and current_password_scheme() and role and stamp) == 0:
+        return 7
     set home to f"home/{name}"
     if disk_exists(home) == 0:
-        set ok to disk_make_folder(home)
-    set ok to log_note(f"created account {name} with role {role}")
+        if disk_make_folder(home) == 0:
+            set rolled_back to disk_remove_file(record_path)
+            return 7
+    set ok to log_note_checked(f"created account {name} with role {role}")
     return 1
 
 ### Check a name and password. Gives back 1 when they match.
@@ -119,12 +169,31 @@ define verify_login with name as Str and password as Str:
     set record to disk_read(record_path)
     set salt to record_field(record and "salt")
     set stored to record_field(record and "secret")
+    set scheme to record_field(record and "scheme")
+    set rounds to string_to_int(record_field(record and "rounds"))
     if string_length(salt) == 0:
         return 0
     if string_length(stored) == 0:
         return 0
-    set attempt to stretch_secret(salt and password)
-    return string_equals(attempt and stored)
+    if rounds < 10000 || rounds > 1000000:
+        return 0
+    if string_equals(scheme and current_password_scheme()) == 1:
+        set attempt to stretch_secret_rounds(salt and password and rounds)
+        return secrets_match(attempt and stored)
+    if string_equals(scheme and "stretched-sha256") == 1:
+        set attempt to legacy_stretch_secret(salt and password and rounds)
+        if secrets_match(attempt and stored) == 0:
+            return 0
+        set role to record_field(record and "role")
+        set created to record_field(record and "created")
+        set fresh_salt to make_salt()
+        set fresh_secret to stretch_secret(fresh_salt and password)
+        if write_account_record(name and fresh_salt and fresh_secret and stretch_rounds() and current_password_scheme() and role and created) == 0:
+            set warned to log_problem_checked(f"could not migrate password record for {name}")
+        else:
+            set noted to log_note_checked(f"migrated password record for {name}")
+        return 1
+    return 0
 
 ### What role does this person have? "admin", "member", or "".
 define account_role with name as Str:
@@ -154,6 +223,7 @@ define delete_account with name as Str:
     if account_exists(name) == 0:
         return 4
     set record_path to account_record_path(name)
-    set ok to disk_remove_file(record_path)
-    set ok to log_note(f"account {name} removed")
+    if disk_remove_file(record_path) == 0:
+        return 7
+    set ok to log_note_checked(f"account {name} removed")
     return 1

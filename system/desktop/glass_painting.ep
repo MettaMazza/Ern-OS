@@ -25,6 +25,12 @@ define colour_window:
 define colour_window_edge:
     return shade(70 and 96 and 130)
 
+define colour_window_chrome:
+    return shade(226 and 233 and 242)
+
+define colour_sidebar:
+    return shade(235 and 241 and 248)
+
 define colour_ink:
     return shade(28 and 36 and 52)
 
@@ -40,6 +46,15 @@ define colour_button_hot:
 define colour_accent:
     return shade(240 and 180 and 70)
 
+define colour_close:
+    return shade(238 and 96 and 92)
+
+define colour_minimise:
+    return shade(240 and 180 and 70)
+
+define colour_expand:
+    return shade(76 and 184 and 118)
+
 define colour_input_box:
     return shade(238 and 242 and 248)
 
@@ -51,7 +66,7 @@ define menu_bar_height:
 
 ### How tall the dock (button row) is.
 define dock_height:
-    return 44
+    return 52
 
 ### The top edge of the dock, given the window height.
 define dock_top with win_h:
@@ -80,15 +95,38 @@ define window_width with win_w:
 define window_height with win_h:
     return input_line_top(win_h) - window_top() - 8
 
+### A familiar desktop window: macOS-like controls in this title strip,
+### with the working conversation and system sidebar below it.
+define window_chrome_height:
+    return 32
+
+define sidebar_width:
+    return 220
+
+define sidebar_left with win_w:
+    return window_left() + window_width(win_w) - sidebar_width()
+
+define glass_conversation_left:
+    return window_left() + 10
+
+define glass_conversation_top:
+    return window_top() + window_chrome_height() + 8
+
+define glass_conversation_width with win_w:
+    return window_width(win_w) - sidebar_width() - 20
+
+define glass_conversation_height with win_h:
+    return window_height(win_h) - window_chrome_height() - 16
+
 # ---- The dock buttons ----
 
 ### How wide one dock button is.
 define dock_button_width:
-    return 150
+    return 130
 
 ### The gap between dock buttons.
 define dock_button_gap:
-    return 8
+    return 7
 
 ### The left edge of dock button number `index` (counting from 0).
 define dock_button_x with index:

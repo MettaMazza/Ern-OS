@@ -12,13 +12,13 @@ The disk is ready.
 Ern-OS needs to know one person before we begin - you.
 You will be the administrator of this machine.
 What should I call you? (letters and digits only) 
-Choose a password (at least 4 characters): 
-*******
+Choose a password (at least 8 characters):
+********
 Pleased to meet you, maria. Your home is /home/maria.
 
 Who are you? 
 Your password? 
-*******
+********
 Welcome back, maria.
 
 -- Welcome to Ern-OS --
@@ -52,8 +52,8 @@ Apps you can open:
   monitor  - how the system is doing
   welcome  - the first-day tour
 /home/maria > 
-Choose a password for finn (at least 4 characters): 
-******
+Choose a password for finn (at least 8 characters):
+**********
 Welcome aboard, finn. Their home is /home/finn.
 /home/maria > 
 People with a place on this machine:
@@ -91,7 +91,7 @@ Goodbye, maria.
 
 Who are you? 
 Your password? 
-******
+**********
 Welcome back, finn.
 
 Say 'help' if you would like to know what I understand.
@@ -109,7 +109,7 @@ Goodbye, finn.
 
 Who are you? 
 Your password? 
-*******
+********
 Welcome back, maria.
 
 Say 'help' if you would like to know what I understand.

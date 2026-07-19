@@ -11,10 +11,12 @@ import "../system/hal/the_terminal.ep"
 import "../system/hal/the_disk.ep"
 import "../system/hal/the_clock.ep"
 import "../system/hal/the_machine.ep"
+import "../system/hal/outside_programs.ep"
 import "../system/kernel/system_log.ep"
 import "../system/kernel/user_accounts.ep"
 import "../system/kernel/sessions.ep"
 import "../system/kernel/virtual_files.ep"
+import "../system/kernel/rebuilding.ep"
 
 define expect_number with label as Str and got and wanted:
     if got == wanted:
@@ -69,8 +71,22 @@ define main:
     set bad to bad + expect_number("member escapes the disk" and vf_write(member and "/../outside" and "x") and 3)
     set bad to bad + expect_number("admin writes anywhere" and vf_write(admin and "/system/allowed" and "fine") and 1)
 
+    # Atomic replacement and recovery.
+    set bad to bad + expect_number("atomic write reports missing parent" and disk_write("home/boss/missing/child" and "x") and 0)
+    set ok to disk_write("home/boss/steady" and "old value")
+    set ok to write_file("disk/home/boss/steady.ern-new" and "unfinished value")
+    set bad to bad + expect_text("completed file wins over stale staging" and disk_read("home/boss/steady") and "old value")
+    set ok to write_file("disk/home/boss/recovered.ern-new" and "new value")
+    set bad to bad + expect_text("orphan staging file is recovered" and disk_read("home/boss/recovered") and "new value")
+
+    # The health probe uses a unique name and never harms an existing note.
+    set ok to disk_write("self_check_note" and "belongs to a person")
+    set bad to bad + expect_number("health probe succeeds" and health_probe_disk() and 1)
+    set bad to bad + expect_text("health probe preserves existing names" and disk_read("self_check_note") and "belongs to a person")
+
     # Moving and removing.
     set bad to bad + expect_number("move a note" and vf_move(admin and "/home/boss/letters/hello" and "/home/boss/letters/greeting") and 1)
+    set bad to bad + expect_number("move to missing parent refused" and vf_move(admin and "/home/boss/letters/greeting" and "/home/boss/missing/greeting") and 4)
     set bad to bad + expect_number("moved note gone from old name" and vf_exists(admin and "/home/boss/letters/hello") and 0)
     set bad to bad + expect_number("remove the note" and vf_remove(admin and "/home/boss/letters/greeting") and 1)
     set bad to bad + expect_number("now empty folder removes" and vf_remove(admin and "/home/boss/letters") and 1)

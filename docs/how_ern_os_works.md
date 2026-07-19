@@ -14,9 +14,10 @@ kernel     system/kernel/*.ep    may use: hal
 hal        system/hal/*.ep       may use: the host (vendored stdlib)
 ```
 
-This rule is the whole plan for bare metal: when Ern-OS one day boots on
-real hardware, the four hal files are rewritten to drive the hardware
-directly, and nothing above them changes.
+This rule bounds the bare-metal plan: when Ern-OS one day boots on real
+hardware, the six hosted HAL modules get hardware or freestanding editions.
+The runtime must also become freestanding; kernel, apps and shell stay on the
+same contracts.
 
 ## The layers
 
@@ -28,6 +29,8 @@ directly, and nothing above them changes.
 | `the_disk.ep` | where bytes live; the only file that knows about `disk/` |
 | `the_clock.ep` | what time it is |
 | `the_machine.ep` | the computer itself (its name, powering off) |
+| `outside_programs.ep` | the hosted self-rebuild's process and binary operations |
+| `the_glass.ep` | the optional raylib window, drawing, mouse and keyboard |
 
 `the_disk.ep` is also the security fence: every path is checked here —
 no `..`, no absolute paths, no strange characters — so nothing above it
@@ -56,12 +59,16 @@ language repo's differential suite) after this project found them.
 
 Answer codes: kernel actions that change things return a small number —
 1 it worked, 2 not allowed, 3 bad name, 4 no such thing, 5 folder not
-empty, 6 already exists. The shell turns these into sentences.
+empty, 6 already exists, 7 the host I/O failed. The shell turns every code
+into a sentence, and checked log calls visibly report a diary failure.
 
-Passwords are never stored. A record keeps `salt` (16 random bytes) and
-`secret` — SHA-256 folded 100,000 times over salt + password. The record
-also names its `scheme`, so a stronger scheme can arrive later and old
-records can be migrated at login.
+Passwords are never stored. A current record keeps `salt` from the operating
+system CSPRNG, `rounds` (currently 200,000), `scheme` and `secret`. The v2
+scheme domain-separates salt and password, then repeatedly folds with the
+runtime's internal SHA-256. Verification uses the record's valid round count
+and compares without an early exit. A successful login to the legacy
+`stretched-sha256` scheme rewrites it in the current form. Passwords must be
+at least eight characters; failed logins are delayed.
 
 ### the glass (graphical) desktop
 
@@ -69,7 +76,7 @@ records can be migrated at login.
 |---|---|
 | `hal/the_glass.ep` | the ONLY window-server touchpoint: raylib loaded at run time, wrapped in plain-English brushes (a box, a line of writing, the mouse, the keys) |
 | `desktop/glass_painting.ep` | pure layout: bar heights, dock-button rectangles, hit-testing, the colour palette — all testable |
-| `desktop/glass_desktop.ep` | the frame loop: menu bar, conversation window, text line, dock; graphical login; runs sentences through the same perform_command |
+| `desktop/glass_desktop.ep` | the frame loop: Mac-like menu/window chrome, Windows-like Start/taskbar, conversation, system sidebar and graphical login; runs sentences through the same perform_command |
 
 The graphical face reuses everything the terminal face built. `say` still
 files output into the transcript (capture mode); the glass paints that
@@ -77,7 +84,7 @@ transcript in a window each frame. Apps ask for input through a second
 hook beside M3's repaint hook — an **input hook**: `ask`/`ask_secret`, when
 one is installed, pull the typed line from the on-screen text line instead
 of the keyboard, so notes/files/monitor run in the window **unchanged**.
-raylib is the one optional dependency; the boot picks the graphical face
+raylib is the one optional graphical dependency; the boot picks that face
 only when `glass_available` says a window is possible, and falls back to
 the terminal desktop otherwise. On bare metal (Phase 2) this file would
 drive a framebuffer instead — the desktop above it wouldn't change.
@@ -95,8 +102,9 @@ compiles a copy of its own source with the vendored toolchain (compiling
 the original name would write over the running binary), boots the result
 headless until it says *all is well*, and only then swaps it in — keeping
 the old binary as `.previous` and restoring it if the swap goes wrong.
-The suite proves the loop every run: two consecutive self-rebuilds must
-emit byte-identical C. `run_command` returns a program's printed output,
+The suite proves the loop every run in a disposable copied worktree: two
+consecutive self-rebuilds must emit byte-identical C, without touching a
+real project disk. `run_command` returns a program's printed output,
 so every step is judged by what it *says* — fittingly for this project.
 
 ### userland — the conversation and the apps
@@ -113,9 +121,11 @@ so every step is judged by what it *says* — fittingly for this project.
 | `apps/monitor.ep` | the system report |
 | `apps/welcome.ep` | the first-day tour (opens itself on first login) |
 
-Apps run in the foreground, in the same program: opening one hands it
-the conversation until it says done. There is at most one at a time,
-one owner of the terminal, and no way to lose data in a handoff.
+Apps run in the foreground, in the same program: opening one hands it the
+conversation until it says done. There is at most one at a time and one
+owner of the terminal. A distinct shutdown signal unwinds nested app input;
+logout clears the graphical session and transcript before another person can
+sign in.
 
 ### The desktop
 
@@ -152,7 +162,39 @@ through different paths collide. So Ern-OS uses a single import manifest:
 person's home, `disk/system/registry/users/` the account records,
 `disk/system/log/` the diary. It is plain files on purpose — you can read
 every part of it with an ordinary file browser, and back it up by copying
-one folder.
+one folder. Replacing content writes a sibling `.ern-new` file and atomically
+renames it into place. On the next access, a final file wins over a stale
+stage; an orphaned complete stage is promoted. That policy covers account
+records, notes and critical state because all of them use `disk_write`.
+
+The runtime supplies SHA-256 and MD5 internally; Ern-OS does not link
+OpenSSL. Random salts and UUIDs use the host CSPRNG (BCryptGenRandom on
+Windows, arc4random on Apple/BSD, getrandom or `/dev/urandom` on Linux/Unix)
+and fail closed rather than falling back to a predictable generator.
+
+## The first bare-metal layer
+
+`baremetal/` is deliberately parallel to the hosted program while the Ernos
+runtime becomes freestanding. Its Multiboot2 entry begins in the bootloader's
+32-bit protected mode, creates four-level identity paging for the first GiB,
+enables x86_64 long mode, establishes its own stack and calls a freestanding C
+kernel. That kernel uses only the new `ern_hal_*` and `ern_*` runtime contracts.
+
+There is no libc, pthread, host filesystem, process, window server or raylib in
+the linked ELF. The current hardware terminal writes directly to COM1; the
+machine HAL halts the CPU. A bounded 1 MiB bump arena supplies the first
+allocator. `epc freestanding` runs the normal Ernos parser, checks, optimizer
+and code generator with a small host-free ABI. The build uses it to compile
+`baremetal/kernel/hello.ep`, whose HAL call and success result are required
+before the kernel emits its final marker. CI boots the GRUB ISO in QEMU and
+requires both the Ernos-authored serial line and that marker.
+
+This does not bypass the layer rule or create a second product. It establishes
+the bottom edge and now carries the first real Ernos-generated function across
+it. ABI v1 is intentionally limited to primitive code and explicit HAL FFI;
+managed collections, threads and the existing Ernos kernel/userland still need
+the freestanding collector, scheduler and disk contracts before they can run
+inside the ELF.
 
 ## Rules of thumb for writing Ern-OS code
 

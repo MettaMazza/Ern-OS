@@ -21,21 +21,26 @@ define main:
     set bad to bad + expect_number("black packs" and shade(0 and 0 and 0) and 4278190080)
 
     # The bars stack up without overlapping, in a 620-tall window.
-    set bad to bad + expect_number("dock sits at the bottom" and dock_top(620) and 620 - 44)
-    set bad to bad + expect_number("input line sits above the dock" and input_line_top(620) and 620 - 44 - 30)
+    set bad to bad + expect_number("dock sits at the bottom" and dock_top(620) and 620 - 52)
+    set bad to bad + expect_number("input line sits above the dock" and input_line_top(620) and 620 - 52 - 30)
     set bad to bad + expect_number("window starts below the menu bar" and window_top() and 44)
+
+    # The main conversation and live sidebar share the window without overlap.
+    set bad to bad + expect_number("sidebar hugs the right edge" and sidebar_left(960) + sidebar_width() and window_left() + window_width(960))
+    set bad to bad + expect_number("conversation leaves room for sidebar" and glass_conversation_width(960) + sidebar_width() + 20 and window_width(960))
+    set bad to bad + expect_number("conversation clears window chrome" and glass_conversation_top() and window_top() + window_chrome_height() + 8)
 
     # Dock buttons are laid left to right with a gap.
     set bad to bad + expect_number("first button x" and dock_button_x(0) and 12)
-    set bad to bad + expect_number("second button x" and dock_button_x(1) and 12 + 150 + 8)
+    set bad to bad + expect_number("second button x" and dock_button_x(1) and 12 + 130 + 7)
 
     # Hit-testing a point inside and outside a button.
     set bx to dock_button_x(2)
     set by to dock_button_y(620)
     set bad to bad + expect_number("centre of button 2 hits" and inside_rect(bx + 40 and by + 10 and bx and by and dock_button_width() and dock_button_height()) and 1)
     set bad to bad + expect_number("far away misses" and inside_rect(5 and 5 and bx and by and dock_button_width() and dock_button_height()) and 0)
-    set bad to bad + expect_number("dock_button_at finds button 2" and dock_button_at(bx + 40 and by + 10 and 620 and 5) and 2)
-    set bad to bad + expect_number("dock_button_at finds none up top" and dock_button_at(50 and 50 and 620 and 5) and 0 - 1)
+    set bad to bad + expect_number("dock_button_at finds button 2" and dock_button_at(bx + 40 and by + 10 and 620 and 6) and 2)
+    set bad to bad + expect_number("dock_button_at finds none up top" and dock_button_at(50 and 50 and 620 and 6) and 0 - 1)
 
     display f"RESULT: {bad} failed"
     return 0

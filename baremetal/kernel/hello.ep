@@ -1,0 +1,7 @@
+# The first Ernos source compiled into the freestanding kernel.
+
+external define ern_baremetal_say with text
+
+define main:
+    set ok to ern_baremetal_say("Ernos payload: the real language crossed the hardware boundary.\n")
+    return ok

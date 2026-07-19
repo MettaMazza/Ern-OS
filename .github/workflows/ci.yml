@@ -1,0 +1,68 @@
+name: Ern-OS verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  baremetal:
+    name: x86_64 bare-metal boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install freestanding linker, GRUB, and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld grub-pc-bin grub-common xorriso qemu-system-x86
+      - name: Compile and boot without a host runtime
+        run: bash tests/test_baremetal_qemu.sh
+
+  linux:
+    name: Linux build and full suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show compiler
+        run: clang --version
+      - name: Build frozen toolchain and Ern-OS
+        run: bash install.sh
+      - name: Inspect generated runtime and linkage
+        run: |
+          grep -q 'BCryptGenRandom' start_ern_os_compiled.c
+          grep -q 'MoveFileExA' start_ern_os_compiled.c
+          ! grep -Eiq 'openssl|libcrypto|-lcrypto' start_ern_os_compiled.c
+          ! ldd start_ern_os | grep -Eiq 'lib(crypto|ssl)'
+      - name: Run isolated full suite
+        run: bash tests/run_all_tests.sh
+      - name: Prove tests did not create a project disk
+        run: test ! -e disk
+
+  windows:
+    name: Windows build and isolated smoke
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show compiler
+        run: clang --version
+      - name: Build Ern-OS
+        run: build_ern_os.bat
+      - name: Inspect generated runtime
+        shell: pwsh
+        run: |
+          $runtime = Get-Content start_ern_os_compiled.c -Raw
+          if ($runtime -notmatch 'BCryptGenRandom') { throw 'Windows CSPRNG path missing' }
+          if ($runtime -notmatch 'MoveFileExA') { throw 'atomic Windows replacement missing' }
+          if ($runtime -match 'openssl|libcrypto|-lcrypto') { throw 'external crypto dependency returned' }
+      - name: Run isolated Windows smoke
+        run: tests\smoke_windows.bat
+      - name: Prove smoke did not create a project disk
+        run: if exist disk exit /b 1

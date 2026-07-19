@@ -15,9 +15,9 @@ Windows terminal understands just as macOS Terminal does.
   These render VT escape sequences, which the desktop needs. (On very old
   consoles the escape codes would show as text; use Windows Terminal.)
 
-Nothing else — no Rust, no Visual Studio. The runtime uses native Win32
-threads, so there is no separate thread library to link. The **graphical
-desktop** additionally needs raylib installed (`libraylib.dll` on the
+Nothing else — no Rust, OpenSSL, Visual Studio or pthread library. The runtime
+uses native Win32 synchronization and threads. The **graphical desktop**
+additionally needs raylib installed (`raylib.dll` or `libraylib.dll` on the
 PATH); without it, Ern-OS runs the terminal desktop, which needs nothing.
 
 ## Build and boot
@@ -43,26 +43,32 @@ start_ern_os.exe --plain
 tests\smoke_windows.bat
 ```
 
-This builds Ern-OS, creates an account, writes a note, restarts, and
-checks the note is still there and that no plain password reached the
-disk — the same durability proof the macOS suite runs.
+This copies the required sources into a unique folder under `%TEMP%`, builds
+there, creates an account, writes a note, restarts, exercises orphan/stale
+atomic-write recovery, preserves a health-probe name collision, and checks
+that no plain password reached the disk. It also self-rebuilds and runs the
+rebuilt binary's health check. It never creates, renames or deletes the
+checkout's `disk\`.
 
-## Honest status
+## Verification and platform details
 
-The macOS build is exercised on every change by the full test suite. The
-**Windows path is written and reviewed for portability but has not yet
-been run on a real Windows machine** — this project is developed on a Mac,
-which cannot execute Windows binaries. The building blocks it depends on
-(the `read_key` / `terminal_columns` / `terminal_rows` / `screen_write`
-runtime builtins, and Win32 threads) all carry `#ifdef _WIN32` native
-paths, and the desktop uses only escape codes both terminals share. If you
-run `tests\smoke_windows.bat` on a PC and it reports trouble, that output
-is exactly what is needed to finish the port — please share it.
+`.github/workflows/ci.yml` runs `build_ern_os.bat` and the isolated smoke on
+a real `windows-latest` GitHub runner for every push and pull request. The job
+also fails if a project-root `disk\` appears. Treat a green Windows job as the
+portability proof for a particular commit; a local macOS run cannot substitute
+for it. Linux separately runs the complete suite and proves it leaves no root
+disk.
 
-Two things known to differ on Windows today:
+Windows-specific runtime paths are deliberate:
 
 - **Passwords typed in the desktop** rely on `_getch`, which reads a key
   at a time without echo — the same as the macOS raw path.
 - **The heartbeat and other services** use Win32 threads through the same
   runtime that the macOS build uses; the thread-safe garbage collector is
   platform-independent.
+- **Random salts and UUIDs** come from `BCryptGenRandom`, loaded from the
+  system `bcrypt.dll`; startup fails closed if the CSPRNG is unavailable.
+- **Atomic replacement** uses `MoveFileExA` with replace-existing and
+  write-through flags. POSIX builds use `rename`.
+- **Crypto hashes** use the vendored runtime implementation, so there is no
+  hidden Homebrew/OpenSSL linker dependency.

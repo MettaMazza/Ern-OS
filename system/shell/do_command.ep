@@ -19,6 +19,8 @@ define explain_refusal with code:
         return "That folder still has things inside it. Empty it first."
     if code == 6:
         return "There is already something with that name."
+    if code == 7:
+        return "The host storage refused that operation. Your existing data was left in place."
     return "Something unexpected went wrong."
 
 define perform_command with session and services and board and cmd:
@@ -117,12 +119,12 @@ define perform_command with session and services and board and cmd:
         if account_exists(target) == 1:
             set ok to say(f"There is already someone called {target}.")
             return 0
-        set password to ask_secret(f"Choose a password for {target} (at least 4 characters): ")
+        set password to ask_secret(f"Choose a password for {target} (at least 8 characters):")
         set made to create_account(target and password and "member")
         if made == 1:
             set ok to say(f"Welcome aboard, {target}. Their home is /home/{target}.")
         else:
-            set ok to say("That did not work - the password may be too short.")
+            set ok to say("That did not work - use at least 8 characters and check that storage is writable.")
         return 0
 
     if string_equals(action and "remove_person") == 1:
@@ -196,7 +198,7 @@ define perform_command with session and services and board and cmd:
         set answer to vf_make_folder(session and target)
         if answer == 1:
             set ok to say(f"Made a folder called {target}.")
-            set ok to log_note(f"{person} made folder {target}")
+            set ok to log_note_checked(f"{person} made folder {target}")
         else:
             set ok to say(explain_refusal(answer))
         return 0
@@ -208,7 +210,7 @@ define perform_command with session and services and board and cmd:
         set answer to vf_write(session and target and extra)
         if answer == 1:
             set ok to say(f"Saved the note {target}.")
-            set ok to log_note(f"{person} wrote note {target}")
+            set ok to log_note_checked(f"{person} wrote note {target}")
         else:
             set ok to say(explain_refusal(answer))
         return 0
@@ -241,7 +243,7 @@ define perform_command with session and services and board and cmd:
         set answer to vf_remove(session and target)
         if answer == 1:
             set ok to say(f"Removed {target}.")
-            set ok to log_note(f"{person} removed {target}")
+            set ok to log_note_checked(f"{person} removed {target}")
         else:
             set ok to say(explain_refusal(answer))
         return 0
@@ -253,7 +255,7 @@ define perform_command with session and services and board and cmd:
         set answer to vf_move(session and target and extra)
         if answer == 1:
             set ok to say(f"Moved {target} to {extra}.")
-            set ok to log_note(f"{person} moved {target} to {extra}")
+            set ok to log_note_checked(f"{person} moved {target} to {extra}")
         else:
             set ok to say(explain_refusal(answer))
         return 0
@@ -262,7 +264,7 @@ define perform_command with session and services and board and cmd:
         if string_equals(role and "admin") == 0:
             set ok to say("Only an admin may rebuild the system.")
             return 0
-        set ok to log_note(f"{person} asked for a system rebuild")
+        set ok to log_note_checked(f"{person} asked for a system rebuild")
         set ok to say("Rebuilding Ern-OS from its own source...")
         set ok to say("  copying my source...")
         if rebuild_copy_source() == 0:
@@ -292,7 +294,7 @@ define perform_command with session and services and board and cmd:
         if string_equals(role and "admin") == 0:
             set ok to say("Only an admin may rebuild the toolchain.")
             return 0
-        set ok to log_note(f"{person} asked for a toolchain rebuild")
+        set ok to log_note_checked(f"{person} asked for a toolchain rebuild")
         set ok to say("Re-baking the vendored compiler from its frozen C...")
         set ok to say("  asking clang to build it...")
         if toolchain_bake() == 0:
@@ -313,17 +315,17 @@ define perform_command with session and services and board and cmd:
         return 0
 
     if string_equals(action and "restart") == 1:
-        set ok to log_note(f"{person} asked to restart")
+        set ok to log_note_checked(f"{person} asked to restart")
         set ok to say("Going down now. Start me again - the new system will boot.")
         return 2
 
     if string_equals(action and "logout") == 1:
-        set ok to log_note(f"{person} logged out")
+        set ok to log_note_checked(f"{person} logged out")
         set ok to say(f"Goodbye, {person}.")
         return 1
 
     if string_equals(action and "shutdown") == 1:
-        set ok to log_note(f"{person} shut the system down")
+        set ok to log_note_checked(f"{person} shut the system down")
         return 2
 
     set ok to say(f"I do not know how to '{action}' yet.")

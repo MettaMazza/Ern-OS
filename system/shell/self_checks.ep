@@ -36,7 +36,7 @@ define run_self_checks:
 
     # The locks: the password folding must give the exact known answer.
     set vector to stretch_secret("ernos-self-check-salt" and "ernos-self-check-word")
-    set expected to "9ec9a275175805a4a802d559a0a58079d76a77adcf306cce521b8f76fb74611e"
+    set expected to "69446ec29cf69e5cce843726c6defef0ce2652923a0dafbbd693c2282032aad6"
     set bad to bad + check_verdict("the locks" and string_equals(vector and expected))
 
     # The face: the desktop's frames must measure exactly.

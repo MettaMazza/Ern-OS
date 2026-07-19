@@ -82,7 +82,7 @@ define service_start with services and board and name as Str:
         set ok to append_list(record and concat(name and ""))
         set ok to append_list(record and 1)
         set ok to append_list(services and record)
-    set ok to log_note(f"service {name} started")
+    set ok to log_note_checked(f"service {name} started")
     return 1
 
 ### Ask a running service how it is doing (its beat count), through the
@@ -107,7 +107,7 @@ define service_stop with services and board and name as Str:
     set answers_name to f"{name} answers"
     set goodbye to board_ask(board and orders_name and answers_name and 1)
     set ok to set_list(record and 1 and 0)
-    set ok to log_note(f"service {name} stopped")
+    set ok to log_note_checked(f"service {name} stopped")
     return 1
 
 ### Lines describing every service, ready to show a person.
@@ -137,10 +137,10 @@ define service_lines with services and board:
 ### Remember when this boot happened.
 define record_boot_moment:
     if disk_exists("system/run") == 0:
-        set ok to disk_make_folder("system/run")
+        if disk_make_folder("system/run") == 0:
+            return 0
     set moment to now_in_seconds()
-    set ok to disk_write("system/run/started" and f"{moment}")
-    return 0
+    return disk_write("system/run/started" and f"{moment}")
 
 ### When did this boot happen? Seconds since 1970, or 0 if unknown.
 define boot_moment:

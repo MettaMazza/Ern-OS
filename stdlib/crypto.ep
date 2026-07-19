@@ -1,10 +1,9 @@
-# ErnosPlain OpenSSL Cryptography Wrapper Standard Library
+# ErnosPlain self-contained cryptography standard library
 
 import "string"
 
-external define SHA256 with data and len and hash_dest
-external define MD5 with data and len and hash_dest
-external define get_list_data_ptr with list
+external define ep_sha256 with s
+external define ep_md5 with s
 
 define byte_to_hex with b:
     set val to b
@@ -37,48 +36,10 @@ define get_byte with val and idx:
     return temp - (temp / 256 * 256)
 
 define crypto_sha256 with s:
-    set len to string_length(s)
-    set hash_list to create_list()
-    set ok to append_list(hash_list and 0)
-    set ok to append_list(hash_list and 0)
-    set ok to append_list(hash_list and 0)
-    set ok to append_list(hash_list and 0)
-    
-    set hash_ptr to get_list_data_ptr(hash_list)
-    set dummy to SHA256(str_to_ptr(s) and len and hash_ptr)
-    
-    set hex_res to ""
-    set word_idx to 0
-    repeat while word_idx < 4:
-        set val to get_list(hash_list and word_idx)
-        set byte_idx to 0
-        repeat while byte_idx < 8:
-            set b to get_byte(val and byte_idx)
-            set hex_res to concat(hex_res and byte_to_hex(b))
-            set byte_idx to byte_idx + 1
-        set word_idx to word_idx + 1
-    return hex_res
+    return concat(ep_sha256(s) and "")
 
 define crypto_md5 with s:
-    set len to string_length(s)
-    set hash_list to create_list()
-    set ok to append_list(hash_list and 0)
-    set ok to append_list(hash_list and 0)
-    
-    set hash_ptr to get_list_data_ptr(hash_list)
-    set dummy to MD5(str_to_ptr(s) and len and hash_ptr)
-    
-    set hex_res to ""
-    set word_idx to 0
-    repeat while word_idx < 2:
-        set val to get_list(hash_list and word_idx)
-        set byte_idx to 0
-        repeat while byte_idx < 8:
-            set b to get_byte(val and byte_idx)
-            set hex_res to concat(hex_res and byte_to_hex(b))
-            set byte_idx to byte_idx + 1
-        set word_idx to word_idx + 1
-    return hex_res
+    return concat(ep_md5(s) and "")
 
 # ---- Base64 ----
 

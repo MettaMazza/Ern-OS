@@ -28,14 +28,14 @@ define main:
     set bad to 0
     set ok to vf_format_disk()
 
-    set bad to bad + expect_number("good account created" and create_account("maria" and "sunrise" and "admin") and 1)
+    set bad to bad + expect_number("good account created" and create_account("maria" and "sunrise8" and "admin") and 1)
     set bad to bad + expect_number("account exists" and account_exists("maria") and 1)
     set bad to bad + expect_number("same name twice refused" and create_account("maria" and "other" and "member") and 0)
-    set bad to bad + expect_number("short password refused" and create_account("pip" and "abc" and "member") and 0)
-    set bad to bad + expect_number("silly name refused" and create_account("ma/ria" and "sunrise" and "member") and 0)
-    set bad to bad + expect_number("spacey name refused" and create_account("ma ria" and "sunrise" and "member") and 0)
+    set bad to bad + expect_number("short password refused" and create_account("pip" and "abcdefg" and "member") and 0)
+    set bad to bad + expect_number("silly name refused" and create_account("ma/ria" and "sunrise8" and "member") and 0)
+    set bad to bad + expect_number("spacey name refused" and create_account("ma ria" and "sunrise8" and "member") and 0)
 
-    set bad to bad + expect_number("right password welcomed" and verify_login("maria" and "sunrise") and 1)
+    set bad to bad + expect_number("right password welcomed" and verify_login("maria" and "sunrise8") and 1)
     set bad to bad + expect_number("wrong password refused" and verify_login("maria" and "moonset") and 0)
     set bad to bad + expect_number("unknown person refused" and verify_login("nobody" and "sunrise") and 0)
 
@@ -48,7 +48,7 @@ define main:
 
     # No plain password may ever reach the disk.
     set record to disk_read("system/registry/users/maria")
-    if string_contains(record and "sunrise") == 1:
+    if string_contains(record and "sunrise8") == 1:
         display "FAIL: password stored in the open"
         set bad to bad + 1
     else:
@@ -57,7 +57,19 @@ define main:
     # A record someone fiddled with must stop working.
     set fiddled to string_replace(record and "secret is " and "secret is 00")
     set ok to disk_write("system/registry/users/maria" and fiddled)
-    set bad to bad + expect_number("fiddled record refused" and verify_login("maria" and "sunrise") and 0)
+    set bad to bad + expect_number("fiddled record refused" and verify_login("maria" and "sunrise8") and 0)
+
+    # An M1 record remains usable and is upgraded atomically after login.
+    set old_salt to "00112233445566778899aabbccddeeff"
+    set old_secret to legacy_stretch_secret(old_salt and "oldpassword" and 100000)
+    set ok to write_account_record("legacy" and old_salt and old_secret and 100000 and "stretched-sha256" and "member" and "2026-01-01 00:00:00")
+    set bad to bad + expect_number("legacy password still works" and verify_login("legacy" and "oldpassword") and 1)
+    set migrated to disk_read("system/registry/users/legacy")
+    if string_contains(migrated and current_password_scheme()) == 1:
+        display "PASS: legacy record migrated to the current scheme"
+    else:
+        display "FAIL: legacy record migrated to the current scheme"
+        set bad to bad + 1
 
     display f"RESULT: {bad} failed"
     return 0

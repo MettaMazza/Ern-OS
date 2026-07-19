@@ -18,11 +18,24 @@
 #   spot 0  full-screen mood? (0 = plain, 1 = full screen)
 #   spot 1  the transcript (a list of lines) the desktop paints
 #   spot 2  the repaint hook (a list holding 0 or 1 closures)
+#   spot 3  the graphical input hook
+#   spot 4  an out-of-band request to end the current conversation
 set the_screen to create_list()
 set screen_init_a to append_list(the_screen and 0)
 set screen_init_b to append_list(the_screen and create_list())
 set screen_init_c to append_list(the_screen and create_list())
 set screen_init_d to append_list(the_screen and create_list())
+set screen_init_e to append_list(the_screen and 0)
+
+### A graphical window close must not masquerade as words typed into an app.
+define request_conversation_shutdown:
+    return set_list(the_screen and 4 and 1)
+
+define conversation_shutdown_requested:
+    return get_list(the_screen and 4)
+
+define clear_conversation_shutdown:
+    return set_list(the_screen and 4 and 0)
 
 ### Are we painting a full-screen desktop right now?
 define in_full_screen:

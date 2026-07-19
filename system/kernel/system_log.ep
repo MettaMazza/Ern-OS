@@ -14,8 +14,7 @@ define log_line with kind as Str and text as Str:
     set stamp to clock_stamp()
     set line to f"[{stamp}] {kind}: {text}"
     set line_with_ending to concat(line and "\n")
-    set ok to disk_append(system_log_path() and line_with_ending)
-    return 0
+    return disk_append(system_log_path() and line_with_ending)
 
 ### Record something ordinary that happened.
 define log_note with text as Str:
@@ -28,6 +27,26 @@ define log_warning with text as Str:
 ### Record something that went wrong.
 define log_problem with text as Str:
     return log_line("problem" and text)
+
+### Record something and make a failed diary write visible immediately.
+### These helpers still return 0 on failure so callers may also react.
+define log_note_checked with text as Str:
+    set written to log_note(text)
+    if written == 0:
+        set shown to say("(Warning: the system diary could not be written.)")
+    return written
+
+define log_warning_checked with text as Str:
+    set written to log_warning(text)
+    if written == 0:
+        set shown to say("(Warning: the system diary could not be written.)")
+    return written
+
+define log_problem_checked with text as Str:
+    set written to log_problem(text)
+    if written == 0:
+        set shown to say("(Warning: the system diary could not be written.)")
+    return written
 
 ### The most recent lines of the diary, newest last — at most `count` of
 ### them. Used by the desktop's diary panel.

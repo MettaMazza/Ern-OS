@@ -60,10 +60,31 @@ define disk_path_is_safe with path as Str:
 define disk_location with path as Str:
     return concat("disk/" and path)
 
+### The sibling used while replacing a file. A completed file is never
+### touched until the whole new value has reached this staging name.
+define disk_staging_location with path as Str:
+    return concat(disk_location(path) and ".ern-new")
+
+### Recover after an interrupted atomic write. If the final file exists it
+### remains authoritative and a stale staging file is discarded. If only the
+### staging file exists, finish the replacement.
+define disk_recover with path as Str:
+    if disk_path_is_safe(path) == 0:
+        return 0
+    set final to disk_location(path)
+    set staged to disk_staging_location(path)
+    if file_exists(staged) == 0:
+        return 1
+    if file_exists(final) == 1:
+        return remove_file(staged)
+    return rename_file(staged and final)
+
 ### Read the whole contents of a file. Gives back "" if it is missing
 ### or the path is not safe.
 define disk_read with path as Str:
     if disk_path_is_safe(path) == 0:
+        return ""
+    if disk_recover(path) == 0:
         return ""
     return concat(read_file(disk_location(path)) and "")
 
@@ -72,19 +93,29 @@ define disk_read with path as Str:
 define disk_write with path as Str and content as Str:
     if disk_path_is_safe(path) == 0:
         return 0
-    set ok to write_file(disk_location(path) and content)
+    if disk_recover(path) == 0:
+        return 0
+    set staged to disk_staging_location(path)
+    if write_file(staged and content) == 0:
+        return 0
+    if rename_file(staged and disk_location(path)) == 0:
+        set cleaned to remove_file(staged)
+        return 0
     return 1
 
 ### Add content to the end of a file.
 define disk_append with path as Str and content as Str:
     if disk_path_is_safe(path) == 0:
         return 0
-    set ok to append_file(disk_location(path) and content)
-    return 1
+    if disk_recover(path) == 0:
+        return 0
+    return append_file(disk_location(path) and content)
 
 ### Does anything live at this path?
 define disk_exists with path as Str:
     if disk_path_is_safe(path) == 0:
+        return 0
+    if disk_recover(path) == 0:
         return 0
     return file_exists(disk_location(path))
 
@@ -109,22 +140,21 @@ define disk_list with path as Str:
 define disk_make_folder with path as Str:
     if disk_path_is_safe(path) == 0:
         return 0
-    set ok to create_directory(disk_location(path))
-    return 1
+    return create_directory(disk_location(path))
 
 ### Remove a single file.
 define disk_remove_file with path as Str:
     if disk_path_is_safe(path) == 0:
         return 0
-    set ok to remove_file(disk_location(path))
-    return 1
+    if disk_recover(path) == 0:
+        return 0
+    return remove_file(disk_location(path))
 
 ### Remove a folder.
 define disk_remove_folder with path as Str:
     if disk_path_is_safe(path) == 0:
         return 0
-    set ok to remove_directory(disk_location(path))
-    return 1
+    return remove_directory(disk_location(path))
 
 ### Give a file or folder a new place or name.
 define disk_rename with old_path as Str and new_path as Str:
@@ -132,11 +162,12 @@ define disk_rename with old_path as Str and new_path as Str:
         return 0
     if disk_path_is_safe(new_path) == 0:
         return 0
-    set ok to rename_file(disk_location(old_path) and disk_location(new_path))
-    return 1
+    if disk_recover(old_path) == 0:
+        return 0
+    return rename_file(disk_location(old_path) and disk_location(new_path))
 
 ### Prepare the disk itself on the very first boot. Internal to boot.
 define disk_prepare:
     if file_exists("disk") == 0:
-        set ok to create_directory("disk")
+        return create_directory("disk")
     return 1

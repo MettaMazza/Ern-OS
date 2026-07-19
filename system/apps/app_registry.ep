@@ -28,7 +28,7 @@ define app_lines:
 ### Open an app by name and stay with it until it finishes.
 define launch_app with session and services and board and name as Str:
     set person to session_person(session)
-    set ok to log_note(f"{person} opened {name}")
+    set ok to log_note_checked(f"{person} opened {name}")
     if string_equals(name and "notes") == 1:
         return run_notes(session)
     if string_equals(name and "files") == 1:

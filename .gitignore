@@ -21,6 +21,7 @@ tests/smoke1.txt
 tests/smoke2.txt
 tests/smoke3.txt
 tests/smoke4.txt
+baremetal/build/
 
 # the living world of a running Ern-OS (personal data, never committed)
 disk/

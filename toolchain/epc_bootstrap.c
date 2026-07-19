@@ -35,6 +35,70 @@ typedef int pthread_attr_t;
 #define pthread_create(t, a, f, arg) ((void)(t), (void)(a), (void)(f), (void)(arg), 0)
 #define pthread_join(t, r) ((void)(t), (void)(r), 0)
 #define pthread_detach(t) ((void)(t), 0)
+#elif defined(_WIN32)
+#include <winsock2.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <setjmp.h>
+#define strdup _strdup
+#if defined(_MSC_VER)
+#define __thread __declspec(thread)
+#endif
+typedef SRWLOCK pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+typedef CRITICAL_SECTION pthread_rwlock_t;
+typedef HANDLE pthread_t;
+typedef int pthread_attr_t;
+#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+#define PTHREAD_COND_INITIALIZER CONDITION_VARIABLE_INIT
+#define PTHREAD_RWLOCK_INITIALIZER {0}
+#define pthread_mutex_init(m, a) ((void)(a), InitializeSRWLock(m), 0)
+#define pthread_mutex_lock(m) (AcquireSRWLockExclusive(m), 0)
+#define pthread_mutex_unlock(m) (ReleaseSRWLockExclusive(m), 0)
+#define pthread_mutex_trylock(m) (TryAcquireSRWLockExclusive(m) ? 0 : 1)
+#define pthread_mutex_destroy(m) ((void)(m), 0)
+#define pthread_cond_init(c, a) ((void)(a), InitializeConditionVariable(c), 0)
+#define pthread_cond_wait(c, m) (SleepConditionVariableSRW(c, m, INFINITE, 0) ? 0 : 1)
+#define pthread_cond_signal(c) (WakeConditionVariable(c), 0)
+#define pthread_cond_broadcast(c) (WakeAllConditionVariable(c), 0)
+#define pthread_cond_destroy(c) ((void)(c), 0)
+#define pthread_rwlock_init(r, a) ((void)(a), InitializeCriticalSection(r), 0)
+#define pthread_rwlock_rdlock(r) (EnterCriticalSection(r), 0)
+#define pthread_rwlock_wrlock(r) (EnterCriticalSection(r), 0)
+#define pthread_rwlock_unlock(r) (LeaveCriticalSection(r), 0)
+#define pthread_rwlock_destroy(r) (DeleteCriticalSection(r), 0)
+typedef struct { void* (*fn)(void*); void* arg; } ep_pthread_start;
+static DWORD WINAPI ep_pthread_trampoline(LPVOID raw) {
+    ep_pthread_start* start = (ep_pthread_start*)raw;
+    void* (*fn)(void*) = start->fn;
+    void* arg = start->arg;
+    free(start);
+    fn(arg);
+    return 0;
+}
+static int ep_pthread_create(pthread_t* thread, void* attrs, void* (*fn)(void*), void* arg) {
+    (void)attrs;
+    ep_pthread_start* start = (ep_pthread_start*)malloc(sizeof(ep_pthread_start));
+    if (!start) return 1;
+    start->fn = fn;
+    start->arg = arg;
+    *thread = CreateThread(NULL, 0, ep_pthread_trampoline, start, 0, NULL);
+    if (!*thread) { free(start); return 1; }
+    return 0;
+}
+#define pthread_create(t, a, f, arg) ep_pthread_create(t, a, f, arg)
+#define pthread_join(t, r) ((void)(r), WaitForSingleObject(t, INFINITE), CloseHandle(t), 0)
+#define pthread_detach(t) (CloseHandle(t), 0)
+static int ep_windows_random(unsigned char* buf, size_t n) {
+    typedef LONG (WINAPI *bcrypt_random_fn)(void*, unsigned char*, unsigned long, unsigned long);
+    HMODULE library = LoadLibraryA("bcrypt.dll");
+    if (!library) return 0;
+    bcrypt_random_fn random_fn = (bcrypt_random_fn)GetProcAddress(library, "BCryptGenRandom");
+    if (!random_fn) { FreeLibrary(library); return 0; }
+    LONG status = random_fn(NULL, buf, (unsigned long)n, 2UL);
+    FreeLibrary(library);
+    return status >= 0 ? 1 : 0;
+}
 #else
 #include <setjmp.h>
 #endif
@@ -48,6 +112,7 @@ typedef int pthread_attr_t;
 #if defined(_WIN32)
 #include <conio.h>
 #include <io.h>
+#include <process.h>
 #elif !defined(__wasm__)
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -61,12 +126,16 @@ typedef int pthread_attr_t;
 #include <fcntl.h>
 
 /* Cryptographically secure random bytes. Uses the OS CSPRNG: arc4random on
-   Apple/BSD, getrandom(2) on Linux (falling back to /dev/urandom), and a
-   /dev/urandom read elsewhere. Only if all of those are unavailable does it
-   fall back to rand() — never on a supported platform. */
+   Apple/BSD, BCryptGenRandom on Windows, getrandom(2) on Linux (with
+   /dev/urandom as a Unix fallback). It fails closed if no CSPRNG is available. */
 static void ep_secure_random_bytes(unsigned char* buf, size_t n) {
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(buf, n);
+#elif defined(_WIN32)
+    if (!ep_windows_random(buf, n)) {
+        fprintf(stderr, "Runtime Error: the Windows CSPRNG is unavailable\n");
+        abort();
+    }
 #else
     size_t got = 0;
   #if defined(__linux__)
@@ -83,8 +152,9 @@ static void ep_secure_random_bytes(unsigned char* buf, size_t n) {
             fclose(f);
         }
     }
-    while (got < n) {
-        buf[got++] = (unsigned char)(rand() & 0xFF);
+    if (got < n) {
+        fprintf(stderr, "Runtime Error: an operating-system CSPRNG is unavailable\n");
+        abort();
     }
 #endif
 }
@@ -2190,7 +2260,11 @@ long long ep_net_listen(long long port) {
 
 long long ep_net_accept(long long server_fd) {
     struct sockaddr_in cli_addr;
+#ifdef _WIN32
+    int clilen = sizeof(cli_addr);
+#else
     socklen_t clilen = sizeof(cli_addr);
+#endif
     int newsockfd = accept((int)server_fd, (struct sockaddr*)&cli_addr, &clilen);
     if (newsockfd >= 0) {
         /* Bound how long a single recv/send may block so a slow or silent
@@ -2212,7 +2286,11 @@ long long ep_net_send(long long fd, const char* data) {
     size_t total = strlen(data);
     size_t off = 0;
     while (off < total) {
+#ifdef _WIN32
+        int n = send((int)fd, data + off, (int)(total - off), 0);
+#else
         ssize_t n = send((int)fd, data + off, total - off, 0);
+#endif
         if (n <= 0) break;
         off += (size_t)n;
     }
@@ -2769,13 +2847,27 @@ long long free_deque(long long dq_ptr) {
 }
 
 /* Filesystem Operations */
-#include <dirent.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 
 long long fs_scan_dir(long long path_val) {
     const char* path = (const char*)path_val;
     long long list_ptr = create_list();
     if (!path) return list_ptr;
+#ifdef _WIN32
+    char pattern[1024];
+    WIN32_FIND_DATAA found;
+    snprintf(pattern, sizeof(pattern), "%s\\*", path);
+    HANDLE search = FindFirstFileA(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE) return list_ptr;
+    do {
+        if (strcmp(found.cFileName, ".") == 0 || strcmp(found.cFileName, "..") == 0) continue;
+        append_list(list_ptr, (long long)strdup(found.cFileName));
+    } while (FindNextFileA(search, &found));
+    FindClose(search);
+#else
     DIR* d = opendir(path);
     if (!d) return list_ptr;
     struct dirent* dir;
@@ -2787,6 +2879,7 @@ long long fs_scan_dir(long long path_val) {
         append_list(list_ptr, (long long)name);
     }
     closedir(d);
+#endif
     return list_ptr;
 }
 
@@ -2897,7 +2990,11 @@ long long ep_http_request(long long method_val, long long url_val, long long hea
     if (sockfd < 0) return (long long)strdup("Error: socket creation failed");
     struct hostent* server = gethostbyname(host);
     if (!server) {
+#ifdef _WIN32
+        closesocket(sockfd);
+#else
         close(sockfd);
+#endif
         return (long long)strdup("Error: host resolution failed");
     }
     struct sockaddr_in serv_addr;
@@ -2906,7 +3003,11 @@ long long ep_http_request(long long method_val, long long url_val, long long hea
     memcpy(&serv_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
     serv_addr.sin_port = htons(port);
     if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+#ifdef _WIN32
+        closesocket(sockfd);
+#else
         close(sockfd);
+#endif
         return (long long)strdup("Error: connection failed");
     }
     char req[4096];
@@ -2920,12 +3021,20 @@ long long ep_http_request(long long method_val, long long url_val, long long hea
         "\r\n",
         method, path, host, body_len, headers ? headers : "", (headers && strlen(headers) > 0 && headers[strlen(headers)-1] != '\n') ? "\r\n" : "");
     if (send(sockfd, req, req_len, 0) < 0) {
+#ifdef _WIN32
+        closesocket(sockfd);
+#else
         close(sockfd);
+#endif
         return (long long)strdup("Error: send failed");
     }
     if (body_len > 0) {
         if (send(sockfd, body, body_len, 0) < 0) {
+#ifdef _WIN32
+            closesocket(sockfd);
+#else
             close(sockfd);
+#endif
             return (long long)strdup("Error: send body failed");
         }
     }
@@ -2937,14 +3046,22 @@ long long ep_http_request(long long method_val, long long url_val, long long hea
         return (long long)strdup("");
     }
     char recv_buf[4096];
+#ifdef _WIN32
+    int n;
+#else
     ssize_t n;
+#endif
     while ((n = recv(sockfd, recv_buf, sizeof(recv_buf), 0)) > 0) {
         if (resp_len + n >= resp_cap) {
             resp_cap *= 2;
             char* new_resp = realloc(resp, resp_cap);
             if (!new_resp) {
                 free(resp);
+#ifdef _WIN32
+                closesocket(sockfd);
+#else
                 close(sockfd);
+#endif
                 return (long long)strdup("Error: memory allocation failed");
             }
             resp = new_resp;
@@ -2953,7 +3070,11 @@ long long ep_http_request(long long method_val, long long url_val, long long hea
         resp_len += n;
     }
     resp[resp_len] = '\0';
+#ifdef _WIN32
+    closesocket(sockfd);
+#else
     close(sockfd);
+#endif
     // Strip HTTP headers — return only the body after \r\n\r\n
     char* http_body = strstr(resp, "\r\n\r\n");
     if (http_body) {
@@ -3614,6 +3735,9 @@ long long screen_write(const char* s) {
 #ifdef _WIN32
   #include <io.h>
   #include <direct.h>
+  #ifndef S_ISDIR
+  #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+  #endif
   #define mkdir(p, m) _mkdir(p)
   #define rmdir _rmdir
   #define getcwd _getcwd
@@ -3735,7 +3859,12 @@ long long ep_remove_directory(long long path_ptr) {
 }
 
 long long ep_rename_file(long long old_ptr, long long new_ptr) {
+#ifdef _WIN32
+    return MoveFileExA((const char*)old_ptr, (const char*)new_ptr,
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 1 : 0;
+#else
     return rename((const char*)old_ptr, (const char*)new_ptr) == 0 ? 1 : 0;
+#endif
 }
 
 long long ep_copy_file(long long src_ptr, long long dst_ptr) {
@@ -3757,12 +3886,23 @@ long long ep_copy_file(long long src_ptr, long long dst_ptr) {
 
 /* ========== Date/Time Runtime ========== */
 #include <time.h>
+#ifndef _WIN32
 #include <sys/time.h>
+#endif
 
 long long ep_time_now_ms(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    ULARGE_INTEGER ticks;
+    GetSystemTimeAsFileTime(&ft);
+    ticks.LowPart = ft.dwLowDateTime;
+    ticks.HighPart = ft.dwHighDateTime;
+    return (long long)((ticks.QuadPart - 116444736000000000ULL) / 10000ULL);
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (long long)tv.tv_sec * 1000LL + (long long)tv.tv_usec / 1000LL;
+#endif
 }
 
 long long ep_time_now_sec(void) {
@@ -4206,7 +4346,64 @@ long long ep_condvar_destroy(long long cv) {
     return 0;
 }
 
-/* ========== Regex (simple stub — delegates to POSIX regex) ========== */
+/* ========== Regex ========== */
+#ifdef _WIN32
+/* Ern-OS itself does not import regex. Keep the generated runtime portable
+   without adding a hidden POSIX-regex DLL: on Windows these generic builtins
+   provide literal-pattern semantics. */
+long long ep_regex_match(long long pattern_ptr, long long text_ptr) {
+    return strstr((const char*)text_ptr, (const char*)pattern_ptr) ? 1 : 0;
+}
+long long ep_regex_find(long long pattern_ptr, long long text_ptr) {
+    const char* pattern = (const char*)pattern_ptr;
+    const char* at = strstr((const char*)text_ptr, pattern);
+    return (long long)(at ? strdup(pattern) : strdup(""));
+}
+long long ep_regex_find_all(long long pattern_ptr, long long text_ptr) {
+    const char* pattern = (const char*)pattern_ptr;
+    const char* cursor = (const char*)text_ptr;
+    size_t len = strlen(pattern);
+    long long list = create_list();
+    if (len == 0) return list;
+    while ((cursor = strstr(cursor, pattern)) != NULL) {
+        append_list(list, (long long)strdup(pattern));
+        cursor += len;
+    }
+    return list;
+}
+long long ep_regex_replace(long long pattern_ptr, long long text_ptr, long long repl_ptr) {
+    const char* pattern = (const char*)pattern_ptr;
+    const char* text = (const char*)text_ptr;
+    const char* repl = (const char*)repl_ptr;
+    const char* at = strstr(text, pattern);
+    if (!at || pattern[0] == '\0') return (long long)strdup(text);
+    size_t before = (size_t)(at - text), plen = strlen(pattern), rlen = strlen(repl);
+    size_t after = strlen(at + plen);
+    char* result = (char*)malloc(before + rlen + after + 1);
+    memcpy(result, text, before);
+    memcpy(result + before, repl, rlen);
+    memcpy(result + before + rlen, at + plen, after + 1);
+    return (long long)result;
+}
+long long ep_regex_split(long long pattern_ptr, long long text_ptr) {
+    const char* pattern = (const char*)pattern_ptr;
+    const char* cursor = (const char*)text_ptr;
+    size_t plen = strlen(pattern);
+    long long list = create_list();
+    if (plen == 0) { append_list(list, text_ptr); return list; }
+    const char* at;
+    while ((at = strstr(cursor, pattern)) != NULL) {
+        size_t len = (size_t)(at - cursor);
+        char* part = (char*)malloc(len + 1);
+        memcpy(part, cursor, len); part[len] = '\0';
+        append_list(list, (long long)part);
+        cursor = at + plen;
+    }
+    append_list(list, (long long)strdup(cursor));
+    return list;
+}
+#else
+/* POSIX builds provide extended regular-expression semantics. */
 #include <regex.h>
 
 long long ep_regex_match(long long pattern_ptr, long long text_ptr) {
@@ -4309,6 +4506,7 @@ long long ep_regex_split(long long pattern_ptr, long long text_ptr) {
     regfree(&regex);
     return list;
 }
+#endif
 
 /* ========== Base64 ========== */
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -5236,7 +5434,9 @@ long long gen_function(long long, long long);
 long long gen_statement(long long, long long, long long, long long);
 long long gen_expr(long long, long long, long long, long long);
 long long get_c_runtime_source();
+long long get_c_freestanding_runtime_source();
 long long get_c_main_source();
+long long get_c_freestanding_main_source();
 long long get_c_test_main_source(long long);
 long long collect_spawns_in_stmts(long long, long long);
 long long collect_all_spawns(long long);
@@ -5247,6 +5447,10 @@ long long inc_borrow_count(long long, long long, long long);
 long long check_safety_stmts(long long, long long, long long, long long, long long, long long, long long, long long, long long, long long);
 long long analyze_safety(long long, long long);
 long long generate_c(long long, long long);
+
+/* Set only by `epc freestanding`.  The frozen bootstrap remains the source of
+   truth for both hosted and freestanding emission. */
+static long long ep_codegen_freestanding = 0LL;
 long long ep_rt_core_0();
 long long ep_rt_core_1();
 long long ep_rt_core_2();
@@ -5742,6 +5946,7 @@ long long _main() {
     long long arg_count = 0;
     long long first_arg = 0;
     long long is_test_mode = 0;
+    long long is_freestanding = 0;
     long long check_only = 0;
     long long input_path = 0;
     long long stem = 0;
@@ -5814,12 +6019,14 @@ long long _main() {
 
     arg_count = get_argument_count();
     if (arg_count < 2LL) {
-    printf("%s\n", (char*)(long long)"Usage: epc <filename.ep> or epc test <filename.ep>");
+    printf("%s\n", (char*)(long long)"Usage: epc <filename.ep> | epc test <filename.ep> | epc check <filename.ep> | epc freestanding <filename.ep>");
     ret_val = 1LL;
     goto L_cleanup;
     }
     first_arg = (long long)get_argument(1LL);
     is_test_mode = 0LL;
+    is_freestanding = 0LL;
+    ep_codegen_freestanding = 0LL;
     check_only = 0LL;
     input_path = (long long)get_argument(1LL);
     if ((strcmp((char*)(long long)"test", (char*)first_arg) == 0)) {
@@ -5838,6 +6045,16 @@ long long _main() {
     goto L_cleanup;
     }
     check_only = 1LL;
+    input_path = (long long)get_argument(2LL);
+    }
+    if ((strcmp((char*)(long long)"freestanding", (char*)first_arg) == 0)) {
+    if (arg_count < 3LL) {
+    printf("%s\n", (char*)(long long)"Usage: epc freestanding <filename.ep>");
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    is_freestanding = 1LL;
+    ep_codegen_freestanding = 1LL;
     input_path = (long long)get_argument(2LL);
     }
     stem = get_file_stem(input_path);
@@ -5907,14 +6124,31 @@ long long _main() {
     ret_val = 1LL;
     goto L_cleanup;
     }
+    if (is_freestanding == 1LL) {
+    c_path = string_concat(stem, (long long)"_freestanding.c");
+    } else {
     c_path = string_concat(stem, (long long)"_compiled.c");
+    }
     ok = write_file_content((char*)c_path, (char*)c_code);
+    if (ok == 0LL) {
+    printf("%s\n", (char*)(long long)"Compilation failed: could not write generated C source.");
+    ret_val = 1LL;
+    goto L_cleanup;
+    }
+    if (is_freestanding == 1LL) {
+    printf("%s\n", (char*)(long long)"[3/3] Freestanding C source ready for the target linker.");
+    printf("%s%s\n", (char*)(long long)"Generated: ", (char*)c_path);
+    ret_val = 0LL;
+    goto L_cleanup;
+    }
     printf("%s\n", (char*)(long long)"[3/3] Compiling and Linking via Clang...");
     compile_cmd = (long long)"clang ";
     compile_cmd = string_concat(compile_cmd, c_path);
     compile_cmd = string_concat(compile_cmd, (long long)" -o ");
     compile_cmd = string_concat(compile_cmd, stem);
+#if !defined(_WIN32)
     compile_cmd = string_concat(compile_cmd, (long long)" -lpthread");
+#endif
     pf_len = length_list(parsed_files);
     pf_idx = 0LL;
     while (pf_idx < pf_len) {
@@ -5927,22 +6161,10 @@ long long _main() {
     compile_cmd = string_concat(compile_cmd, (long long)" -DEP_HAS_SQLITE -lsqlite3");
     }
     }
-    if (pf_len_str > 8LL) {
-    ext_crypto = (long long)substring((char*)pf_str, (pf_len_str - 9LL), 9LL);
-    if ((strcmp((char*)(long long)"crypto.ep", (char*)ext_crypto) == 0)) {
-    compile_cmd = string_concat(compile_cmd, (long long)" -L/opt/homebrew/opt/openssl/lib -lcrypto");
-    }
-    }
     if (pf_len_str > 5LL) {
     ext_gui = (long long)substring((char*)pf_str, (pf_len_str - 6LL), 6LL);
     if ((strcmp((char*)(long long)"gui.ep", (char*)ext_gui) == 0)) {
     compile_cmd = string_concat(compile_cmd, (long long)" -lraylib");
-    }
-    }
-    if (pf_len_str > 8LL) {
-    ext_cry = (long long)substring((char*)pf_str, (pf_len_str - 9LL), 9LL);
-    if ((strcmp((char*)(long long)"crypto.ep", (char*)ext_cry) == 0)) {
-    compile_cmd = string_concat(compile_cmd, (long long)" -L/opt/homebrew/opt/openssl/lib -lcrypto");
     }
     }
     pf_idx = (pf_idx + 1LL);
@@ -16272,7 +16494,38 @@ long long get_c_runtime_source() {
 
     ep_gc_maybe_collect();
 
+    if (ep_codegen_freestanding == 1LL) {
+    ret_val = get_c_freestanding_runtime_source();
+    goto L_cleanup;
+    }
     ret_val = get_shared_runtime_source();
+    goto L_cleanup;
+L_cleanup:
+    return ret_val;
+}
+
+long long get_c_freestanding_runtime_source() {
+    long long ret_val = 0;
+
+    ep_gc_maybe_collect();
+
+    /* This is deliberately a small ABI, not a pretend hosted libc.  The first
+       freestanding slice supports primitive Ernos code and explicit HAL FFI.
+       Managed values, threads and hosted services will be added with their
+       real kernel implementations in later milestones. */
+    ret_val = (long long)
+        "#include <stddef.h>\n"
+        "#include <stdint.h>\n"
+        "\n"
+        "/* Ernos freestanding runtime ABI v1. */\n"
+        "void (*ep_gc_mark_globals_major)(void) = 0;\n"
+        "void (*ep_gc_mark_globals_minor)(void) = 0;\n"
+        "void ep_gc_maybe_collect(void) {}\n"
+        "void ep_gc_push_root(long long *root) { (void)root; }\n"
+        "void ep_gc_pop_roots(long long count) { (void)count; }\n"
+        "void ep_gc_mark_object(void *object) { (void)object; }\n"
+        "void ep_gc_mark_object_minor(void *object) { (void)object; }\n"
+        "\n";
     goto L_cleanup;
 L_cleanup:
     return ret_val;
@@ -16300,6 +16553,23 @@ long long get_c_main_source() {
     goto L_cleanup;
 L_cleanup:
     ep_gc_pop_roots(1);
+    return ret_val;
+}
+
+long long get_c_freestanding_main_source() {
+    long long ret_val = 0;
+
+    ep_gc_maybe_collect();
+
+    ret_val = (long long)
+        "\n/* Called by the architecture-neutral bare-metal kernel. */\n"
+        "void __ep_init_constants(void);\n"
+        "long long ern_freestanding_program(void) {\n"
+        "    __ep_init_constants();\n"
+        "    return _main();\n"
+        "}\n";
+    goto L_cleanup;
+L_cleanup:
     return ret_val;
 }
 
@@ -17960,7 +18230,9 @@ long long generate_c(long long program, long long is_test_mode) {
     }
     idx = (idx + 1LL);
     }
-    if (is_test_mode == 1LL) {
+    if (ep_codegen_freestanding == 1LL) {
+    ok = emit(state, get_c_freestanding_main_source());
+    } else if (is_test_mode == 1LL) {
     ok = emit(state, get_c_test_main_source(program));
     } else {
     ok = emit(state, get_c_main_source());
@@ -18026,6 +18298,71 @@ long long ep_rt_core_0() {
     ok = append_list(lines, (long long)"#define pthread_create(t, a, f, arg) ((void)(t), (void)(a), (void)(f), (void)(arg), 0)\n");
     ok = append_list(lines, (long long)"#define pthread_join(t, r) ((void)(t), (void)(r), 0)\n");
     ok = append_list(lines, (long long)"#define pthread_detach(t) ((void)(t), 0)\n");
+    ok = append_list(lines, (long long)"#elif defined(_WIN32)\n");
+    ok = append_list(lines, (long long)"#include <winsock2.h>\n");
+    ok = append_list(lines, (long long)"#define WIN32_LEAN_AND_MEAN\n");
+    ok = append_list(lines, (long long)"#include <windows.h>\n");
+    ok = append_list(lines, (long long)"#include <setjmp.h>\n");
+    ok = append_list(lines, (long long)"#define strdup _strdup\n");
+    ok = append_list(lines, (long long)"#if defined(_MSC_VER)\n");
+    ok = append_list(lines, (long long)"#define __thread __declspec(thread)\n");
+    ok = append_list(lines, (long long)"typedef SSIZE_T ssize_t;\n");
+    ok = append_list(lines, (long long)"#define close closesocket\n");
+    ok = append_list(lines, (long long)"#endif\n");
+    ok = append_list(lines, (long long)"typedef SRWLOCK pthread_mutex_t;\n");
+    ok = append_list(lines, (long long)"typedef CONDITION_VARIABLE pthread_cond_t;\n");
+    ok = append_list(lines, (long long)"typedef CRITICAL_SECTION pthread_rwlock_t;\n");
+    ok = append_list(lines, (long long)"typedef HANDLE pthread_t;\n");
+    ok = append_list(lines, (long long)"typedef int pthread_attr_t;\n");
+    ok = append_list(lines, (long long)"#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT\n");
+    ok = append_list(lines, (long long)"#define PTHREAD_COND_INITIALIZER CONDITION_VARIABLE_INIT\n");
+    ok = append_list(lines, (long long)"#define PTHREAD_RWLOCK_INITIALIZER {0}\n");
+    ok = append_list(lines, (long long)"#define pthread_mutex_init(m, a) ((void)(a), InitializeSRWLock(m), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_mutex_lock(m) (AcquireSRWLockExclusive(m), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_mutex_unlock(m) (ReleaseSRWLockExclusive(m), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_mutex_trylock(m) (TryAcquireSRWLockExclusive(m) ? 0 : 1)\n");
+    ok = append_list(lines, (long long)"#define pthread_mutex_destroy(m) ((void)(m), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_cond_init(c, a) ((void)(a), InitializeConditionVariable(c), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_cond_wait(c, m) (SleepConditionVariableSRW(c, m, INFINITE, 0) ? 0 : 1)\n");
+    ok = append_list(lines, (long long)"#define pthread_cond_signal(c) (WakeConditionVariable(c), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_cond_broadcast(c) (WakeAllConditionVariable(c), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_cond_destroy(c) ((void)(c), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_rwlock_init(r, a) ((void)(a), InitializeCriticalSection(r), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_rwlock_rdlock(r) (EnterCriticalSection(r), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_rwlock_wrlock(r) (EnterCriticalSection(r), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_rwlock_unlock(r) (LeaveCriticalSection(r), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_rwlock_destroy(r) (DeleteCriticalSection(r), 0)\n");
+    ok = append_list(lines, (long long)"typedef struct { void* (*fn)(void*); void* arg; } ep_pthread_start;\n");
+    ok = append_list(lines, (long long)"static DWORD WINAPI ep_pthread_trampoline(LPVOID raw) {\n");
+    ok = append_list(lines, (long long)"    ep_pthread_start* start = (ep_pthread_start*)raw;\n");
+    ok = append_list(lines, (long long)"    void* (*fn)(void*) = start->fn;\n");
+    ok = append_list(lines, (long long)"    void* arg = start->arg;\n");
+    ok = append_list(lines, (long long)"    free(start);\n");
+    ok = append_list(lines, (long long)"    fn(arg);\n");
+    ok = append_list(lines, (long long)"    return 0;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"static int ep_pthread_create(pthread_t* thread, void* attrs, void* (*fn)(void*), void* arg) {\n");
+    ok = append_list(lines, (long long)"    (void)attrs;\n");
+    ok = append_list(lines, (long long)"    ep_pthread_start* start = (ep_pthread_start*)malloc(sizeof(ep_pthread_start));\n");
+    ok = append_list(lines, (long long)"    if (!start) return 1;\n");
+    ok = append_list(lines, (long long)"    start->fn = fn; start->arg = arg;\n");
+    ok = append_list(lines, (long long)"    *thread = CreateThread(NULL, 0, ep_pthread_trampoline, start, 0, NULL);\n");
+    ok = append_list(lines, (long long)"    if (!*thread) { free(start); return 1; }\n");
+    ok = append_list(lines, (long long)"    return 0;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"#define pthread_create(t, a, f, arg) ep_pthread_create(t, a, f, arg)\n");
+    ok = append_list(lines, (long long)"#define pthread_join(t, r) ((void)(r), WaitForSingleObject(t, INFINITE), CloseHandle(t), 0)\n");
+    ok = append_list(lines, (long long)"#define pthread_detach(t) (CloseHandle(t), 0)\n");
+    ok = append_list(lines, (long long)"static int ep_windows_random(unsigned char* buf, size_t n) {\n");
+    ok = append_list(lines, (long long)"    typedef LONG (WINAPI *bcrypt_random_fn)(void*, unsigned char*, unsigned long, unsigned long);\n");
+    ok = append_list(lines, (long long)"    HMODULE library = LoadLibraryA(\"bcrypt.dll\");\n");
+    ok = append_list(lines, (long long)"    if (!library) return 0;\n");
+    ok = append_list(lines, (long long)"    bcrypt_random_fn random_fn = (bcrypt_random_fn)GetProcAddress(library, \"BCryptGenRandom\");\n");
+    ok = append_list(lines, (long long)"    if (!random_fn) { FreeLibrary(library); return 0; }\n");
+    ok = append_list(lines, (long long)"    LONG status = random_fn(NULL, buf, (unsigned long)n, 2UL);\n");
+    ok = append_list(lines, (long long)"    FreeLibrary(library);\n");
+    ok = append_list(lines, (long long)"    return status >= 0 ? 1 : 0;\n");
+    ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"#else\n");
     ok = append_list(lines, (long long)"#include <setjmp.h>\n");
     ok = append_list(lines, (long long)"#endif\n");
@@ -18039,6 +18376,7 @@ long long ep_rt_core_0() {
     ok = append_list(lines, (long long)"#if defined(_WIN32)\n");
     ok = append_list(lines, (long long)"#include <conio.h>\n");
     ok = append_list(lines, (long long)"#include <io.h>\n");
+    ok = append_list(lines, (long long)"#include <process.h>\n");
     ok = append_list(lines, (long long)"#elif !defined(__wasm__)\n");
     ok = append_list(lines, (long long)"#include <termios.h>\n");
     ok = append_list(lines, (long long)"#include <sys/ioctl.h>\n");
@@ -18052,12 +18390,16 @@ long long ep_rt_core_0() {
     ok = append_list(lines, (long long)"#include <fcntl.h>\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"/* Cryptographically secure random bytes. Uses the OS CSPRNG: arc4random on\n");
-    ok = append_list(lines, (long long)"   Apple/BSD, getrandom(2) on Linux (falling back to /dev/urandom), and a\n");
-    ok = append_list(lines, (long long)"   /dev/urandom read elsewhere. Only if all of those are unavailable does it\n");
-    ok = append_list(lines, (long long)"   fall back to rand() — never on a supported platform. */\n");
+    ok = append_list(lines, (long long)"   Apple/BSD, BCryptGenRandom on Windows, getrandom(2) on Linux (with\n");
+    ok = append_list(lines, (long long)"   /dev/urandom as a Unix fallback). It fails closed if no CSPRNG is available. */\n");
     ok = append_list(lines, (long long)"static void ep_secure_random_bytes(unsigned char* buf, size_t n) {\n");
     ok = append_list(lines, (long long)"#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)\n");
     ok = append_list(lines, (long long)"    arc4random_buf(buf, n);\n");
+    ok = append_list(lines, (long long)"#elif defined(_WIN32)\n");
+    ok = append_list(lines, (long long)"    if (!ep_windows_random(buf, n)) {\n");
+    ok = append_list(lines, (long long)"        fprintf(stderr, \"Runtime Error: the Windows CSPRNG is unavailable\\n\");\n");
+    ok = append_list(lines, (long long)"        abort();\n");
+    ok = append_list(lines, (long long)"    }\n");
     ok = append_list(lines, (long long)"#else\n");
     ok = append_list(lines, (long long)"    size_t got = 0;\n");
     ok = append_list(lines, (long long)"  #if defined(__linux__)\n");
@@ -18074,8 +18416,9 @@ long long ep_rt_core_0() {
     ok = append_list(lines, (long long)"            fclose(f);\n");
     ok = append_list(lines, (long long)"        }\n");
     ok = append_list(lines, (long long)"    }\n");
-    ok = append_list(lines, (long long)"    while (got < n) {\n");
-    ok = append_list(lines, (long long)"        buf[got++] = (unsigned char)(rand() & 0xFF);\n");
+    ok = append_list(lines, (long long)"    if (got < n) {\n");
+    ok = append_list(lines, (long long)"        fprintf(stderr, \"Runtime Error: an operating-system CSPRNG is unavailable\\n\");\n");
+    ok = append_list(lines, (long long)"        abort();\n");
     ok = append_list(lines, (long long)"    }\n");
     ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"}\n");
@@ -20405,7 +20748,11 @@ long long ep_rt_core_14() {
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_net_accept(long long server_fd) {\n");
     ok = append_list(lines, (long long)"    struct sockaddr_in cli_addr;\n");
+    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
+    ok = append_list(lines, (long long)"    int clilen = sizeof(cli_addr);\n");
+    ok = append_list(lines, (long long)"#else\n");
     ok = append_list(lines, (long long)"    socklen_t clilen = sizeof(cli_addr);\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"    int newsockfd = accept((int)server_fd, (struct sockaddr*)&cli_addr, &clilen);\n");
     ok = append_list(lines, (long long)"    if (newsockfd >= 0) {\n");
     ok = append_list(lines, (long long)"        /* Bound how long a single recv/send may block so a slow or silent\n");
@@ -20427,7 +20774,11 @@ long long ep_rt_core_14() {
     ok = append_list(lines, (long long)"    size_t total = strlen(data);\n");
     ok = append_list(lines, (long long)"    size_t off = 0;\n");
     ok = append_list(lines, (long long)"    while (off < total) {\n");
+    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
+    ok = append_list(lines, (long long)"        int n = send((int)fd, data + off, (int)(total - off), 0);\n");
+    ok = append_list(lines, (long long)"#else\n");
     ok = append_list(lines, (long long)"        ssize_t n = send((int)fd, data + off, total - off, 0);\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"        if (n <= 0) break;\n");
     ok = append_list(lines, (long long)"        off += (size_t)n;\n");
     ok = append_list(lines, (long long)"    }\n");
@@ -21048,13 +21399,27 @@ long long ep_rt_core_18() {
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"/* Filesystem Operations */\n");
-    ok = append_list(lines, (long long)"#include <dirent.h>\n");
     ok = append_list(lines, (long long)"#include <sys/stat.h>\n");
+    ok = append_list(lines, (long long)"#ifndef _WIN32\n");
+    ok = append_list(lines, (long long)"#include <dirent.h>\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long fs_scan_dir(long long path_val) {\n");
     ok = append_list(lines, (long long)"    const char* path = (const char*)path_val;\n");
     ok = append_list(lines, (long long)"    long long list_ptr = create_list();\n");
     ok = append_list(lines, (long long)"    if (!path) return list_ptr;\n");
+    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
+    ok = append_list(lines, (long long)"    char pattern[1024];\n");
+    ok = append_list(lines, (long long)"    WIN32_FIND_DATAA found;\n");
+    ok = append_list(lines, (long long)"    snprintf(pattern, sizeof(pattern), \"%s\\\\*\", path);\n");
+    ok = append_list(lines, (long long)"    HANDLE search = FindFirstFileA(pattern, &found);\n");
+    ok = append_list(lines, (long long)"    if (search == INVALID_HANDLE_VALUE) return list_ptr;\n");
+    ok = append_list(lines, (long long)"    do {\n");
+    ok = append_list(lines, (long long)"        if (strcmp(found.cFileName, \".\") == 0 || strcmp(found.cFileName, \"..\") == 0) continue;\n");
+    ok = append_list(lines, (long long)"        append_list(list_ptr, (long long)strdup(found.cFileName));\n");
+    ok = append_list(lines, (long long)"    } while (FindNextFileA(search, &found));\n");
+    ok = append_list(lines, (long long)"    FindClose(search);\n");
+    ok = append_list(lines, (long long)"#else\n");
     ok = append_list(lines, (long long)"    DIR* d = opendir(path);\n");
     ok = append_list(lines, (long long)"    if (!d) return list_ptr;\n");
     ok = append_list(lines, (long long)"    struct dirent* dir;\n");
@@ -21066,6 +21431,7 @@ long long ep_rt_core_18() {
     ok = append_list(lines, (long long)"        append_list(list_ptr, (long long)name);\n");
     ok = append_list(lines, (long long)"    }\n");
     ok = append_list(lines, (long long)"    closedir(d);\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"    return list_ptr;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
@@ -21989,6 +22355,9 @@ long long ep_rt_core_24() {
     ok = append_list(lines, (long long)"#ifdef _WIN32\n");
     ok = append_list(lines, (long long)"  #include <io.h>\n");
     ok = append_list(lines, (long long)"  #include <direct.h>\n");
+    ok = append_list(lines, (long long)"  #ifndef S_ISDIR\n");
+    ok = append_list(lines, (long long)"  #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)\n");
+    ok = append_list(lines, (long long)"  #endif\n");
     ok = append_list(lines, (long long)"  #define mkdir(p, m) _mkdir(p)\n");
     ok = append_list(lines, (long long)"  #define rmdir _rmdir\n");
     ok = append_list(lines, (long long)"  #define getcwd _getcwd\n");
@@ -22110,7 +22479,12 @@ long long ep_rt_core_24() {
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_rename_file(long long old_ptr, long long new_ptr) {\n");
+    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
+    ok = append_list(lines, (long long)"    return MoveFileExA((const char*)old_ptr, (const char*)new_ptr,\n");
+    ok = append_list(lines, (long long)"                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 1 : 0;\n");
+    ok = append_list(lines, (long long)"#else\n");
     ok = append_list(lines, (long long)"    return rename((const char*)old_ptr, (const char*)new_ptr) == 0 ? 1 : 0;\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_copy_file(long long src_ptr, long long dst_ptr) {\n");
@@ -22148,12 +22522,23 @@ long long ep_rt_core_25() {
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"/* ========== Date/Time Runtime ========== */\n");
     ok = append_list(lines, (long long)"#include <time.h>\n");
+    ok = append_list(lines, (long long)"#ifndef _WIN32\n");
     ok = append_list(lines, (long long)"#include <sys/time.h>\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_time_now_ms(void) {\n");
+    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
+    ok = append_list(lines, (long long)"    FILETIME ft;\n");
+    ok = append_list(lines, (long long)"    ULARGE_INTEGER ticks;\n");
+    ok = append_list(lines, (long long)"    GetSystemTimeAsFileTime(&ft);\n");
+    ok = append_list(lines, (long long)"    ticks.LowPart = ft.dwLowDateTime;\n");
+    ok = append_list(lines, (long long)"    ticks.HighPart = ft.dwHighDateTime;\n");
+    ok = append_list(lines, (long long)"    return (long long)((ticks.QuadPart - 116444736000000000ULL) / 10000ULL);\n");
+    ok = append_list(lines, (long long)"#else\n");
     ok = append_list(lines, (long long)"    struct timeval tv;\n");
     ok = append_list(lines, (long long)"    gettimeofday(&tv, NULL);\n");
     ok = append_list(lines, (long long)"    return (long long)tv.tv_sec * 1000LL + (long long)tv.tv_usec / 1000LL;\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_time_now_sec(void) {\n");
@@ -22645,7 +23030,62 @@ long long ep_rt_core_28() {
     ok = append_list(lines, (long long)"    return 0;\n");
     ok = append_list(lines, (long long)"}\n");
     ok = append_list(lines, (long long)"\n");
-    ok = append_list(lines, (long long)"/* ========== Regex (simple stub — delegates to POSIX regex) ========== */\n");
+    ok = append_list(lines, (long long)"/* ========== Regex ========== */\n");
+    ok = append_list(lines, (long long)"#ifdef _WIN32\n");
+    ok = append_list(lines, (long long)"/* Literal-pattern fallback: no hidden POSIX-regex DLL dependency. */\n");
+    ok = append_list(lines, (long long)"long long ep_regex_match(long long pattern_ptr, long long text_ptr) {\n");
+    ok = append_list(lines, (long long)"    return strstr((const char*)text_ptr, (const char*)pattern_ptr) ? 1 : 0;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"long long ep_regex_find(long long pattern_ptr, long long text_ptr) {\n");
+    ok = append_list(lines, (long long)"    const char* pattern = (const char*)pattern_ptr;\n");
+    ok = append_list(lines, (long long)"    const char* at = strstr((const char*)text_ptr, pattern);\n");
+    ok = append_list(lines, (long long)"    return (long long)(at ? strdup(pattern) : strdup(\"\"));\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"long long ep_regex_find_all(long long pattern_ptr, long long text_ptr) {\n");
+    ok = append_list(lines, (long long)"    const char* pattern = (const char*)pattern_ptr;\n");
+    ok = append_list(lines, (long long)"    const char* cursor = (const char*)text_ptr;\n");
+    ok = append_list(lines, (long long)"    size_t len = strlen(pattern);\n");
+    ok = append_list(lines, (long long)"    long long list = create_list();\n");
+    ok = append_list(lines, (long long)"    if (len == 0) return list;\n");
+    ok = append_list(lines, (long long)"    while ((cursor = strstr(cursor, pattern)) != NULL) {\n");
+    ok = append_list(lines, (long long)"        append_list(list, (long long)strdup(pattern));\n");
+    ok = append_list(lines, (long long)"        cursor += len;\n");
+    ok = append_list(lines, (long long)"    }\n");
+    ok = append_list(lines, (long long)"    return list;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"long long ep_regex_replace(long long pattern_ptr, long long text_ptr, long long repl_ptr) {\n");
+    ok = append_list(lines, (long long)"    const char* pattern = (const char*)pattern_ptr;\n");
+    ok = append_list(lines, (long long)"    const char* text = (const char*)text_ptr;\n");
+    ok = append_list(lines, (long long)"    const char* repl = (const char*)repl_ptr;\n");
+    ok = append_list(lines, (long long)"    const char* at = strstr(text, pattern);\n");
+    ok = append_list(lines, (long long)"    if (!at || pattern[0] == '\\0') return (long long)strdup(text);\n");
+    ok = append_list(lines, (long long)"    size_t before = (size_t)(at - text), plen = strlen(pattern), rlen = strlen(repl);\n");
+    ok = append_list(lines, (long long)"    size_t after = strlen(at + plen);\n");
+    ok = append_list(lines, (long long)"    char* result = (char*)malloc(before + rlen + after + 1);\n");
+    ok = append_list(lines, (long long)"    memcpy(result, text, before);\n");
+    ok = append_list(lines, (long long)"    memcpy(result + before, repl, rlen);\n");
+    ok = append_list(lines, (long long)"    memcpy(result + before + rlen, at + plen, after + 1);\n");
+    ok = append_list(lines, (long long)"    return (long long)result;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"long long ep_regex_split(long long pattern_ptr, long long text_ptr) {\n");
+    ok = append_list(lines, (long long)"    const char* pattern = (const char*)pattern_ptr;\n");
+    ok = append_list(lines, (long long)"    const char* cursor = (const char*)text_ptr;\n");
+    ok = append_list(lines, (long long)"    size_t plen = strlen(pattern);\n");
+    ok = append_list(lines, (long long)"    long long list = create_list();\n");
+    ok = append_list(lines, (long long)"    if (plen == 0) { append_list(list, text_ptr); return list; }\n");
+    ok = append_list(lines, (long long)"    const char* at;\n");
+    ok = append_list(lines, (long long)"    while ((at = strstr(cursor, pattern)) != NULL) {\n");
+    ok = append_list(lines, (long long)"        size_t len = (size_t)(at - cursor);\n");
+    ok = append_list(lines, (long long)"        char* part = (char*)malloc(len + 1);\n");
+    ok = append_list(lines, (long long)"        memcpy(part, cursor, len); part[len] = '\\0';\n");
+    ok = append_list(lines, (long long)"        append_list(list, (long long)part);\n");
+    ok = append_list(lines, (long long)"        cursor = at + plen;\n");
+    ok = append_list(lines, (long long)"    }\n");
+    ok = append_list(lines, (long long)"    append_list(list, (long long)strdup(cursor));\n");
+    ok = append_list(lines, (long long)"    return list;\n");
+    ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"#else\n");
+    ok = append_list(lines, (long long)"/* POSIX builds provide extended regular-expression semantics. */\n");
     ok = append_list(lines, (long long)"#include <regex.h>\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"long long ep_regex_match(long long pattern_ptr, long long text_ptr) {\n");
@@ -22748,6 +23188,7 @@ long long ep_rt_core_28() {
     ok = append_list(lines, (long long)"    regfree(&regex);\n");
     ok = append_list(lines, (long long)"    return list;\n");
     ok = append_list(lines, (long long)"}\n");
+    ok = append_list(lines, (long long)"#endif\n");
     ok = append_list(lines, (long long)"\n");
     ok = append_list(lines, (long long)"/* ========== Base64 ========== */\n");
     ok = append_list(lines, (long long)"static const char b64_table[] = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\";\n");

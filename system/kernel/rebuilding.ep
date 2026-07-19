@@ -15,9 +15,9 @@
 define rebuild_copy_source:
     set ok to outside_copy("start_ern_os.ep" and "rebuilt_ern_os.ep")
     if ok == 1:
-        set noted to log_note("rebuild: source copied")
+        set noted to log_note_checked("rebuild: source copied")
         return 1
-    set noted to log_problem("rebuild: could not copy the source")
+        set noted to log_problem_checked("rebuild: could not copy the source")
     return 0
 
 ### Step 2: compile the copy with the vendored toolchain.
@@ -27,9 +27,9 @@ define rebuild_compile:
     else:
         set said to outside_run("./toolchain/epc rebuilt_ern_os.ep 2>&1")
     if string_contains(said and "compilation successful") == 1:
-        set noted to log_note("rebuild: compiled")
+        set noted to log_note_checked("rebuild: compiled")
         return 1
-    set noted to log_problem("rebuild: the compile failed")
+        set noted to log_problem_checked("rebuild: the compile failed")
     return 0
 
 ### Step 3: boot the new system just to check it says all is well.
@@ -40,9 +40,9 @@ define rebuild_check:
     else:
         set said to outside_run(f"./{fresh} --just-checking 2>&1")
     if string_contains(said and "all is well") == 1:
-        set noted to log_note("rebuild: the new system checks out")
+        set noted to log_note_checked("rebuild: the new system checks out")
         return 1
-    set noted to log_problem("rebuild: the new system failed its checks")
+        set noted to log_problem_checked("rebuild: the new system failed its checks")
     return 0
 
 ### Step 4: keep the old system as .previous and put the new one in place.
@@ -51,15 +51,15 @@ define rebuild_swap:
     set fresh to runnable_name("rebuilt_ern_os")
     set kept to outside_move(current and concat(current and ".previous"))
     if kept == 0:
-        set noted to log_problem("rebuild: could not set the old system aside")
+        set noted to log_problem_checked("rebuild: could not set the old system aside")
         return 0
     set placed to outside_move(fresh and current)
     if placed == 0:
         # put the old one back rather than leave no system at all
         set restored to outside_move(concat(current and ".previous") and current)
-        set noted to log_problem("rebuild: could not put the new system in place")
+        set noted to log_problem_checked("rebuild: could not put the new system in place")
         return 0
-    set noted to log_note("rebuild: the new system is in place")
+        set noted to log_note_checked("rebuild: the new system is in place")
     return 1
 
 ### Step 5: sweep up the source copy. (The generated C stays behind on
@@ -73,10 +73,17 @@ define rebuild_tidy:
 ### disk, read it back, throw it away. 1 when the disk tells the truth.
 define health_probe_disk:
     set prepared to disk_prepare()
-    set wrote to disk_write("self_check_note" and "still breathing")
-    set back to disk_read("self_check_note")
+    if prepared == 0:
+        return 0
+    set probe to concat("self_check_" and uuid_v4())
+    set wrote to disk_write(probe and "still breathing")
+    if wrote == 0:
+        return 0
+    set back to disk_read(probe)
     set matches to string_equals(back and "still breathing")
-    set removed to disk_remove_file("self_check_note")
+    set removed to disk_remove_file(probe)
+    if removed == 0:
+        return 0
     return matches
 
 # ---- The shorter loop: re-bake the vendored compiler itself ----
@@ -89,9 +96,9 @@ define toolchain_bake:
     else:
         set said to outside_run(f"clang -O2 toolchain/epc_bootstrap.c -o toolchain/{fresh} -lpthread && echo TOOLCHAIN_OK")
     if string_contains(said and "TOOLCHAIN_OK") == 1:
-        set noted to log_note("toolchain: baked fresh from the frozen C")
+        set noted to log_note_checked("toolchain: baked fresh from the frozen C")
         return 1
-    set noted to log_problem("toolchain: clang could not bake it")
+        set noted to log_problem_checked("toolchain: clang could not bake it")
     return 0
 
 ### Step 2: prove the fresh compiler still compiles this very system.
@@ -104,9 +111,9 @@ define toolchain_check:
     else:
         set said to outside_run("./toolchain/epc_next rebuilt_ern_os.ep 2>&1")
     if string_contains(said and "compilation successful") == 1:
-        set noted to log_note("toolchain: the fresh compiler compiles the system")
+        set noted to log_note_checked("toolchain: the fresh compiler compiles the system")
         return 1
-    set noted to log_problem("toolchain: the fresh compiler failed to compile the system")
+        set noted to log_problem_checked("toolchain: the fresh compiler failed to compile the system")
     return 0
 
 ### Step 3: put the fresh compiler in place of the old one.
@@ -118,9 +125,9 @@ define toolchain_swap:
     else:
         set placed to outside_move(f"toolchain/{fresh}" and f"toolchain/{current}")
     if placed == 1:
-        set noted to log_note("toolchain: the fresh compiler is in place")
+        set noted to log_note_checked("toolchain: the fresh compiler is in place")
         return 1
-    set noted to log_problem("toolchain: could not put the fresh compiler in place")
+        set noted to log_problem_checked("toolchain: could not put the fresh compiler in place")
     return 0
 
 ### Step 4: sweep up after the toolchain check.
